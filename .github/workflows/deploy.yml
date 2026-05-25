@@ -1,0 +1,29 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: GOOS=linux GOARCH=amd64 go build -o wishapp .
+
+      - name: Deploy
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ssh.samblundell.co.uk >> ~/.ssh/known_hosts 2>/dev/null
+          scp wishapp sam@ssh.samblundell.co.uk:/opt/wishapp/wishapp
+          ssh sam@ssh.samblundell.co.uk 'sudo systemctl restart wishapp'
