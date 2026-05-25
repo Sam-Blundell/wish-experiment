@@ -26,4 +26,4 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ssh.samblundell.co.uk >> ~/.ssh/known_hosts 2>/dev/null
           scp wishapp sam@ssh.samblundell.co.uk:/opt/wishapp/wishapp
-          ssh sam@ssh.samblundell.co.uk 'sudo systemctl restart wishapp'
+          ssh sam@ssh.samblundell.co.uk 'chmod 755 /opt/wishapp/wishapp && sudo systemctl restart wishapp'
