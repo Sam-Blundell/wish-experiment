@@ -76,8 +76,8 @@ func (r *room) join(c *client) (bool, int) {
 	if len(r.clients) >= maxClients {
 		return false, len(r.clients)
 	}
-	r.clients[c] = struct{}{}
 	r.broadcast(chatMsg{from: "", text: c.displayName() + " joined"})
+	r.clients[c] = struct{}{}
 	return true, len(r.clients)
 }
 
@@ -228,7 +228,7 @@ func (m model) View() string {
 		Foreground(dim)
 
 	// Render messages
-	chatHeight := m.height - 4
+	chatHeight := m.height - 5
 	if chatHeight < 1 {
 		chatHeight = 1
 	}
@@ -267,7 +267,7 @@ func (m model) View() string {
 	screen := lipgloss.NewStyle().Padding(0, 2).Render(
 		chat + "\n" +
 			separator + "\n" +
-			input + "  " + help,
+			input + "\n" + help,
 	)
 
 	if !m.showModal {
