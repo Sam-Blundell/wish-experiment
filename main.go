@@ -135,6 +135,7 @@ type model struct {
 	client     *client
 	sub        chan chatMsg
 	showModal  bool
+	renderer   *lipgloss.Renderer
 }
 
 func waitForMsg(sub chan chatMsg) tea.Cmd {
@@ -206,25 +207,27 @@ func (m model) View() string {
 		chatWidth = 20
 	}
 
-	inputStyle := lipgloss.NewStyle().
+	r := m.renderer
+
+	inputStyle := r.NewStyle().
 		Foreground(white)
 
-	promptStyle := lipgloss.NewStyle().
+	promptStyle := r.NewStyle().
 		Foreground(purple).
 		Bold(true)
 
-	systemStyle := lipgloss.NewStyle().
+	systemStyle := r.NewStyle().
 		Foreground(dim).
 		Italic(true)
 
-	senderStyle := lipgloss.NewStyle().
+	senderStyle := r.NewStyle().
 		Foreground(purple).
 		Bold(true)
 
-	msgStyle := lipgloss.NewStyle().
+	msgStyle := r.NewStyle().
 		Foreground(white)
 
-	helpStyle := lipgloss.NewStyle().
+	helpStyle := r.NewStyle().
 		Foreground(dim)
 
 	// Render messages
@@ -256,7 +259,7 @@ func (m model) View() string {
 
 	chat := strings.Join(lines, "\n")
 
-	separator := lipgloss.NewStyle().
+	separator := r.NewStyle().
 		Foreground(dim).
 		Render(strings.Repeat("─", chatWidth))
 
@@ -264,7 +267,7 @@ func (m model) View() string {
 
 	help := helpStyle.Render("/nick <name> to set name · ctrl+c to quit")
 
-	screen := lipgloss.NewStyle().Padding(0, 2).Render(
+	screen := r.NewStyle().Padding(0, 2).Render(
 		chat + "\n" +
 			separator + "\n" +
 			input + "\n" + help,
@@ -274,7 +277,7 @@ func (m model) View() string {
 		return screen
 	}
 
-	modalStyle := lipgloss.NewStyle().
+	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(purple).
 		Padding(1, 3).
@@ -283,12 +286,13 @@ func (m model) View() string {
 		Align(lipgloss.Center)
 
 	modalText := "Messages here are public and\nvisible to anyone who joins.\n\n" +
-		lipgloss.NewStyle().Foreground(dim).Render("press any key to continue")
+		r.NewStyle().Foreground(dim).Render("press any key to continue")
 
 	modal := modalStyle.Render(modalText)
 
 	if m.width > 0 {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+		return r.PlaceHorizontal(m.width, lipgloss.Center,
+			r.PlaceVertical(m.height, lipgloss.Center, modal))
 	}
 	return modal
 }
@@ -317,11 +321,13 @@ func main() {
 					chatRoom.leave(c)
 				}()
 
+				renderer := bubbletea.MakeRenderer(s)
 				m := model{
 					messages:  chatRoom.history(),
 					client:    c,
 					sub:       c.send,
 					showModal: true,
+					renderer:  renderer,
 				}
 
 				return m, []tea.ProgramOption{tea.WithAltScreen()}
