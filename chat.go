@@ -4,8 +4,8 @@ import (
 	"strings"
 	"sync"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/ssh"
 )
 
@@ -116,10 +116,10 @@ type chatScreen struct {
 	messages []chatMsg
 	client   *client
 	sub      chan chatMsg
-	renderer *lipgloss.Renderer
+	showHelp bool
 }
 
-func newChatScreen(s ssh.Session, r *lipgloss.Renderer, ip string, width, height int) Screen {
+func newChatScreen(s ssh.Session, ip string, width, height int) Screen {
 	c := &client{
 		send: make(chan chatMsg, 100),
 		ip:   ip,
@@ -128,7 +128,7 @@ func newChatScreen(s ssh.Session, r *lipgloss.Renderer, ip string, width, height
 
 	ok, _ := chatRoom.join(c)
 	if !ok {
-		return newFullScreen(r, width, height)
+		return newFullScreen(width, height)
 	}
 
 	// Ensure we leave the room if the user disconnects entirely. Normal exit
@@ -144,7 +144,6 @@ func newChatScreen(s ssh.Session, r *lipgloss.Renderer, ip string, width, height
 		client:   c,
 		sub:      c.send,
 		messages: chatRoom.history(),
-		renderer: r,
 	}
 }
 
@@ -166,12 +165,19 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case chatIncomingMsg:
 		m.messages = append(m.messages, chatMsg(msg))
 		return m, chatWaitForMsg(m.sub)
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyEsc:
+	case tea.KeyPressMsg:
+		// When the help modal is open, any key (other than ctrl+c, which the
+		// root handles) just closes it. Messages keep arriving in the
+		// background via chatIncomingMsg above.
+		if m.showHelp {
+			m.showHelp = false
+			return m, nil
+		}
+		switch msg.String() {
+		case "esc":
 			chatRoom.leave(m.client)
 			return m, func() tea.Msg { return ShowDirectoryMsg{} }
-		case tea.KeyEnter:
+		case "enter":
 			text := strings.TrimSpace(m.input)
 			m.input = ""
 			if text == "" {
@@ -180,6 +186,10 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			if text == "/exit" {
 				chatRoom.leave(m.client)
 				return m, func() tea.Msg { return ShowDirectoryMsg{} }
+			}
+			if text == "/help" {
+				m.showHelp = true
+				return m, nil
 			}
 			if strings.HasPrefix(text, "/nick ") {
 				newNick := strings.TrimSpace(strings.TrimPrefix(text, "/nick "))
@@ -192,15 +202,15 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				return m, nil
 			}
 			chatRoom.send(chatMsg{from: m.client.displayName(), text: text})
-		case tea.KeyBackspace:
+		case "backspace":
 			if len(m.input) > 0 {
 				m.input = m.input[:len(m.input)-1]
 			}
 		default:
-			if msg.Type == tea.KeyRunes {
-				m.input += string(msg.Runes)
-			} else if msg.Type == tea.KeySpace {
-				m.input += " "
+			// Any printable text — single character or multi-rune paste — comes
+			// through here. msg.Text is empty for purely non-text keys.
+			if msg.Text != "" {
+				m.input += msg.Text
 			}
 		}
 	}
@@ -208,24 +218,19 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 }
 
 func (m chatScreen) View() string {
-	r := m.renderer
-	dim := lipgloss.Color("241")
-	purple := lipgloss.Color("212")
-	white := lipgloss.Color("252")
-
 	chatWidth := m.width - 4
 	if chatWidth < 20 {
 		chatWidth = 20
 	}
 
-	inputStyle := r.NewStyle().Foreground(white)
-	promptStyle := r.NewStyle().Foreground(purple).Bold(true)
-	systemStyle := r.NewStyle().Foreground(dim).Italic(true)
-	senderStyle := r.NewStyle().Foreground(purple).Bold(true)
-	msgStyle := r.NewStyle().Foreground(white)
-	helpStyle := r.NewStyle().Foreground(dim)
+	inputStyle := lipgloss.NewStyle().Foreground(colorCream)
+	promptStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true)
+	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	msgStyle := lipgloss.NewStyle().Foreground(colorCream)
+	helpStyle := lipgloss.NewStyle().Foreground(colorAmberDim)
 
-	wrap := r.NewStyle().Width(chatWidth)
+	wrap := lipgloss.NewStyle().Width(chatWidth)
 
 	// Render the input first so we can measure its height. The chat area
 	// shrinks as the input grows so the whole layout still fits the terminal.
@@ -245,8 +250,6 @@ func (m chatScreen) View() string {
 		} else {
 			line = senderStyle.Render(msg.from+": ") + msgStyle.Render(msg.text)
 		}
-		// Wrap to chatWidth; each visual line becomes its own entry so
-		// chatHeight slicing below counts wrapped lines correctly.
 		lines = append(lines, strings.Split(wrap.Render(line), "\n")...)
 	}
 
@@ -258,22 +261,52 @@ func (m chatScreen) View() string {
 	}
 
 	chat := strings.Join(lines, "\n")
-	separator := r.NewStyle().Foreground(dim).Render(strings.Repeat("─", chatWidth))
-	help := helpStyle.Render("/nick <name> · /exit or esc to leave · ctrl+c to disconnect")
+	separator := lipgloss.NewStyle().Foreground(colorAmberDim).Render(strings.Repeat("═", chatWidth))
+	help := helpStyle.Render("type /help for commands")
 
-	return r.NewStyle().Padding(0, 2).Render(
+	base := lipgloss.NewStyle().Padding(0, 2).Render(
 		chat + "\n" + separator + "\n" + input + "\n" + help,
 	)
+
+	if !m.showHelp {
+		return base
+	}
+
+	modal := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorAmber).
+		Padding(1, 3).
+		Foreground(colorCream).
+		Render(
+			lipgloss.NewStyle().Bold(true).Foreground(colorAmber).Render("Commands") + "\n\n" +
+				"/nick <name>   set your display name\n" +
+				"/help          show this help\n" +
+				"/exit          leave the chatroom\n" +
+				"esc            leave the chatroom\n" +
+				"ctrl+c         disconnect\n\n" +
+				lipgloss.NewStyle().Foreground(colorAmberDim).Render("press any key to close"),
+		)
+
+	// Composite the modal over the base view using v2's layer compositor.
+	if m.width > 0 {
+		compositor := lipgloss.NewCompositor(
+			lipgloss.NewLayer(base),
+			lipgloss.NewLayer(modal).
+				X((m.width-lipgloss.Width(modal))/2).
+				Y((m.height-lipgloss.Height(modal))/2),
+		)
+		return compositor.Render()
+	}
+	return modal
 }
 
 type fullScreen struct {
-	width    int
-	height   int
-	renderer *lipgloss.Renderer
+	width  int
+	height int
 }
 
-func newFullScreen(r *lipgloss.Renderer, width, height int) Screen {
-	return fullScreen{renderer: r, width: width, height: height}
+func newFullScreen(width, height int) Screen {
+	return fullScreen{width: width, height: height}
 }
 
 func (s fullScreen) Init() tea.Cmd { return nil }
@@ -283,7 +316,7 @@ func (s fullScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.width = m.Width
 		s.height = m.Height
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		_ = m
 		return s, func() tea.Msg { return ShowDirectoryMsg{} }
 	}
@@ -291,14 +324,14 @@ func (s fullScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 }
 
 func (s fullScreen) View() string {
-	box := s.renderer.NewStyle().
+	box := lipgloss.NewStyle().
 		Padding(1, 2).
-		Foreground(lipgloss.Color("241")).
+		Foreground(colorAmberDim).
 		Render("Room is full.\n\npress any key to go back")
 
 	if s.width > 0 {
-		return s.renderer.PlaceHorizontal(s.width, lipgloss.Center,
-			s.renderer.PlaceVertical(s.height, lipgloss.Center, box))
+		return lipgloss.PlaceHorizontal(s.width, lipgloss.Center,
+			lipgloss.PlaceVertical(s.height, lipgloss.Center, box))
 	}
 	return box
 }

@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/wish/v2"
+	"charm.land/wish/v2/bubbletea"
 	"github.com/charmbracelet/ssh"
-	"github.com/charmbracelet/wish"
-	"github.com/charmbracelet/wish/bubbletea"
 )
 
 const (
@@ -28,9 +28,8 @@ func main() {
 		wish.WithMiddleware(
 			bubbletea.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 				ip, _, _ := net.SplitHostPort(s.RemoteAddr().String())
-				renderer := bubbletea.MakeRenderer(s)
-				root := newRoot(s, ip, renderer)
-				return root, []tea.ProgramOption{tea.WithAltScreen()}
+				root := newRoot(s, ip)
+				return root, nil
 			}),
 		),
 	)

@@ -1,18 +1,17 @@
 package main
 
 import (
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type welcomeScreen struct {
-	width    int
-	height   int
-	renderer *lipgloss.Renderer
+	width  int
+	height int
 }
 
-func newWelcomeScreen(r *lipgloss.Renderer) welcomeScreen {
-	return welcomeScreen{renderer: r}
+func newWelcomeScreen() welcomeScreen {
+	return welcomeScreen{}
 }
 
 func (s welcomeScreen) Init() tea.Cmd { return nil }
@@ -22,7 +21,7 @@ func (s welcomeScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.width = m.Width
 		s.height = m.Height
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		_ = m
 		return s, func() tea.Msg { return ShowDirectoryMsg{} }
 	}
@@ -30,16 +29,11 @@ func (s welcomeScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 }
 
 func (s welcomeScreen) View() string {
-	r := s.renderer
-	purple := lipgloss.Color("212")
-	dim := lipgloss.Color("241")
-	white := lipgloss.Color("252")
-
-	box := r.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(purple).
+	box := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorAmber).
 		Padding(1, 3).
-		Foreground(white).
+		Foreground(colorCream).
 		Bold(true).
 		Align(lipgloss.Center).
 		Render(
@@ -47,12 +41,12 @@ func (s welcomeScreen) View() string {
 				"This server is open to anyone.\n" +
 				"Everything is public.\n" +
 				"You have been warned.\n\n" +
-				r.NewStyle().Foreground(dim).Render("press any key to continue"),
+				lipgloss.NewStyle().Foreground(colorAmberDim).Render("press any key to continue"),
 		)
 
 	if s.width > 0 {
-		return r.PlaceHorizontal(s.width, lipgloss.Center,
-			r.PlaceVertical(s.height, lipgloss.Center, box))
+		return lipgloss.PlaceHorizontal(s.width, lipgloss.Center,
+			lipgloss.PlaceVertical(s.height, lipgloss.Center, box))
 	}
 	return box
 }

@@ -1,8 +1,7 @@
 package main
 
 import (
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/ssh"
 )
 
@@ -18,22 +17,21 @@ type Screen interface {
 // swap to a different screen.
 type ShowDirectoryMsg struct{}
 type EnterChatMsg struct{}
+type EnterAboutMsg struct{}
 
 type rootModel struct {
-	active   Screen
-	session  ssh.Session
-	ip       string
-	width    int
-	height   int
-	renderer *lipgloss.Renderer
+	active  Screen
+	session ssh.Session
+	ip      string
+	width   int
+	height  int
 }
 
-func newRoot(s ssh.Session, ip string, r *lipgloss.Renderer) rootModel {
+func newRoot(s ssh.Session, ip string) rootModel {
 	return rootModel{
-		session:  s,
-		ip:       ip,
-		renderer: r,
-		active:   newWelcomeScreen(r),
+		session: s,
+		ip:      ip,
+		active:  newWelcomeScreen(),
 	}
 }
 
@@ -43,7 +41,7 @@ func (m rootModel) Init() tea.Cmd {
 
 func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ctrl+c closes the SSH session from anywhere in the app.
-	if k, ok := msg.(tea.KeyMsg); ok && k.Type == tea.KeyCtrlC {
+	if k, ok := msg.(tea.KeyPressMsg); ok && k.String() == "ctrl+c" {
 		return m, tea.Quit
 	}
 
@@ -52,10 +50,13 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case ShowDirectoryMsg:
-		m.active = newDirectoryScreen(m.renderer, m.width, m.height)
+		m.active = newDirectoryScreen(m.width, m.height)
 		return m, m.active.Init()
 	case EnterChatMsg:
-		m.active = newChatScreen(m.session, m.renderer, m.ip, m.width, m.height)
+		m.active = newChatScreen(m.session, m.ip, m.width, m.height)
+		return m, m.active.Init()
+	case EnterAboutMsg:
+		m.active = newAboutScreen(m.width, m.height)
 		return m, m.active.Init()
 	}
 
@@ -64,6 +65,8 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m rootModel) View() string {
-	return m.active.View()
+func (m rootModel) View() tea.View {
+	v := tea.NewView(m.active.View())
+	v.AltScreen = true
+	return v
 }

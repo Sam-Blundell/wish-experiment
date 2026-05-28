@@ -3,8 +3,8 @@ package main
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type directoryScreen struct {
@@ -12,15 +12,13 @@ type directoryScreen struct {
 	height   int
 	selected int
 	options  []string
-	renderer *lipgloss.Renderer
 }
 
-func newDirectoryScreen(r *lipgloss.Renderer, width, height int) directoryScreen {
+func newDirectoryScreen(width, height int) directoryScreen {
 	return directoryScreen{
-		renderer: r,
-		width:    width,
-		height:   height,
-		options:  []string{"testchat", "exit"},
+		width:   width,
+		height:  height,
+		options: []string{"testchat", "about", "exit"},
 	}
 }
 
@@ -31,7 +29,7 @@ func (s directoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		s.width = m.Width
 		s.height = m.Height
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch m.String() {
 		case "up", "k":
 			if s.selected > 0 {
@@ -45,6 +43,8 @@ func (s directoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			switch s.options[s.selected] {
 			case "testchat":
 				return s, func() tea.Msg { return EnterChatMsg{} }
+			case "about":
+				return s, func() tea.Msg { return EnterAboutMsg{} }
 			case "exit":
 				return s, tea.Quit
 			}
@@ -56,18 +56,13 @@ func (s directoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 }
 
 func (s directoryScreen) View() string {
-	r := s.renderer
-	purple := lipgloss.Color("212")
-	dim := lipgloss.Color("241")
-	white := lipgloss.Color("252")
+	selectedStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	normalStyle := lipgloss.NewStyle().Foreground(colorCream)
+	helpStyle := lipgloss.NewStyle().Foreground(colorAmberDim)
+	titleStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
 
-	selectedStyle := r.NewStyle().Foreground(purple).Bold(true)
-	normalStyle := r.NewStyle().Foreground(white)
-	helpStyle := r.NewStyle().Foreground(dim)
-	titleStyle := r.NewStyle().Foreground(purple).Bold(true)
-
-	// Pad options to the widest one so the "> " marker stays in a stable
-	// position no matter which option is selected.
+	// Pad options to the widest one so the marker stays in a stable position
+	// no matter which option is selected.
 	maxOpt := 0
 	for _, opt := range s.options {
 		if w := lipgloss.Width(opt); w > maxOpt {
@@ -79,7 +74,7 @@ func (s directoryScreen) View() string {
 	for i, opt := range s.options {
 		padded := opt + strings.Repeat(" ", maxOpt-lipgloss.Width(opt))
 		if i == s.selected {
-			menu = append(menu, selectedStyle.Render("> "+padded))
+			menu = append(menu, selectedStyle.Render("► "+padded))
 		} else {
 			menu = append(menu, normalStyle.Render("  "+padded))
 		}
@@ -87,15 +82,13 @@ func (s directoryScreen) View() string {
 
 	help := "↑↓ to move · enter to select · q to quit"
 
-	// Pick a content width that fits the widest piece, then center each piece
-	// inside that width so they all share the same horizontal axis.
 	contentWidth := lipgloss.Width(help)
 	if w := maxOpt + 2; w > contentWidth {
 		contentWidth = w
 	}
-	center := r.NewStyle().Width(contentWidth).Align(lipgloss.Center)
+	center := lipgloss.NewStyle().Width(contentWidth).Align(lipgloss.Center)
 
-	box := strings.Join([]string{
+	inner := strings.Join([]string{
 		center.Render(titleStyle.Render("Directory")),
 		"",
 		center.Render(strings.Join(menu, "\n")),
@@ -103,9 +96,15 @@ func (s directoryScreen) View() string {
 		center.Render(helpStyle.Render(help)),
 	}, "\n")
 
+	box := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorAmber).
+		Padding(1, 4).
+		Render(inner)
+
 	if s.width > 0 {
-		return r.PlaceHorizontal(s.width, lipgloss.Center,
-			r.PlaceVertical(s.height, lipgloss.Center, box))
+		return lipgloss.PlaceHorizontal(s.width, lipgloss.Center,
+			lipgloss.PlaceVertical(s.height, lipgloss.Center, box))
 	}
 	return box
 }
