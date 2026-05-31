@@ -25,9 +25,11 @@ func newDirectoryScreen(width, height int) directoryScreen {
 		width:   width,
 		height:  height,
 		// A slice literal — like a list/array in most languages.
-		options: []string{"testchat", "game", "about", "exit"},
+		options: []string{"testchat", "gametest", "about", "exit"},
 	}
 }
+
+func (s directoryScreen) title() string { return "directory" }
 
 func (s directoryScreen) Init() tea.Cmd { return nil }
 
@@ -55,7 +57,7 @@ func (s directoryScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			switch s.options[s.selected] {
 			case "testchat":
 				return s, func() tea.Msg { return EnterChatMsg{} }
-			case "game":
+			case "gametest":
 				return s, func() tea.Msg { return EnterGameMsg{} }
 			case "about":
 				return s, func() tea.Msg { return EnterAboutMsg{} }

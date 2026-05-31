@@ -37,6 +37,10 @@ type Screen interface {
 	Init() tea.Cmd
 	Update(msg tea.Msg) (Screen, tea.Cmd)
 	View() string
+	// title returns the SSH client's window title for this screen. We pass
+	// it up via the root model's View, which is the only place Bubble Tea
+	// reads window-title config from.
+	title() string
 }
 
 // These three are *navigation messages*. A screen can return a `tea.Cmd`
@@ -125,11 +129,19 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // In Bubble Tea v2, View returns a `tea.View` (not just a string) so you
-// can configure things like alt-screen mode alongside the rendered output.
-// `AltScreen = true` makes the program take over the whole terminal and
-// restore it on exit — the standard fullscreen-app behaviour.
+// can configure things like alt-screen mode and window title alongside the
+// rendered output. `AltScreen = true` makes the program take over the whole
+// terminal and restore it on exit — the standard fullscreen-app behaviour.
+//
+// `Cursor = nil` hides the terminal cursor. Bubble Tea v2 shows a cursor
+// by default; we explicitly hide it because none of our screens use it
+// (chat draws its own block cursor inside the input). Individual screens
+// can override this by including a `tea.Cursor` in their own state and
+// surfacing it — but at present nobody does.
 func (m rootModel) View() tea.View {
 	v := tea.NewView(m.active.View())
 	v.AltScreen = true
+	v.Cursor = nil
+	v.WindowTitle = "wish · " + m.active.title()
 	return v
 }

@@ -24,7 +24,10 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/wish/v2"
+	"charm.land/wish/v2/activeterm"
 	"charm.land/wish/v2/bubbletea"
+	"charm.land/wish/v2/logging"
+	"charm.land/wish/v2/recover"
 	"github.com/charmbracelet/ssh"
 )
 
@@ -53,18 +56,33 @@ func main() {
 		// is the bridge between Wish (SSH) and Bubble Tea (the TUI framework):
 		// for each session it spins up a Bubble Tea program whose root model
 		// is whatever the function returns.
+		// Wish middlewares compose first-to-last but *execute* last-to-first,
+		// so the last entry in any middleware list is the outermost wrapper.
+		//
+		//   recover    — outermost: catches panics in anything below so one
+		//                user's crash doesn't kill the whole server. Takes
+		//                the middlewares it should protect as its arguments.
+		//   logging    — logs connect/disconnect with addr, TERM, duration.
+		//   activeterm — rejects connections without a real TTY (e.g.
+		//                someone running `ssh server some-command`), which
+		//                would otherwise crash inside Bubble Tea.
+		//   bubbletea  — innermost: the actual handler that runs our TUI.
 		wish.WithMiddleware(
-			bubbletea.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-				// `net.SplitHostPort` returns three values (host, port, err).
-				// We assign all three but use `_` (the blank identifier) to
-				// discard the port and the error — a Go convention for "I
-				// don't care about this return value".
-				ip, _, _ := net.SplitHostPort(s.RemoteAddr().String())
-				root := newRoot(s, ip)
-				// A function in Go can return multiple values. Here we return
-				// the root model and `nil` for the program options (no extras).
-				return root, nil
-			}),
+			recover.Middleware(
+				bubbletea.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+					// `net.SplitHostPort` returns three values (host, port, err).
+					// We assign all three but use `_` (the blank identifier) to
+					// discard the port and the error — a Go convention for "I
+					// don't care about this return value".
+					ip, _, _ := net.SplitHostPort(s.RemoteAddr().String())
+					root := newRoot(s, ip)
+					// A function in Go can return multiple values. Here we return
+					// the root model and `nil` for the program options (no extras).
+					return root, nil
+				}),
+				activeterm.Middleware(),
+				logging.Middleware(),
+			),
 		),
 	)
 	// Standard Go error handling: functions that can fail return an `error`

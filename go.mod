@@ -3,6 +3,7 @@ module github.com/Sam-Blundell/wish-experiment
 go 1.26.3
 
 require (
+	charm.land/bubbles/v2 v2.1.0
 	charm.land/bubbletea/v2 v2.0.6
 	charm.land/lipgloss/v2 v2.0.3
 	charm.land/wish/v2 v2.0.1
@@ -12,6 +13,7 @@ require (
 require (
 	charm.land/log/v2 v2.0.0 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
+	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/keygen v0.5.4 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260416155717-489999b90468 // indirect

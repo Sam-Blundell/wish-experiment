@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/ssh"
@@ -174,7 +176,7 @@ type chatIncomingMsg chatMsg
 type chatScreen struct {
 	width    int
 	height   int
-	input    string
+	input    textarea.Model
 	messages []chatMsg
 	client   *client
 	sub      chan chatMsg
@@ -211,9 +213,44 @@ func newChatScreen(s ssh.Session, ip string, width, height int) Screen {
 		chatRoom.leave(c)
 	}()
 
+	// Set up the textarea widget from bubbles. Multi-line, soft-wrapping,
+	// dynamically grows up to 5 rows as the user types — beyond that it
+	// scrolls internally. Enter sends the message (handled in Update),
+	// ctrl+j or alt+enter inserts a newline.
+	//
+	// Focus() has a *pointer* receiver and mutates the model in place.
+	// We call it here (on the local `ta` variable, which is addressable)
+	// before storing the value into the chatScreen struct, so the focus
+	// state travels along with the value. Doing this in Init() instead
+	// would mutate a copy that gets discarded.
+	ta := textarea.New()
+	ta.Prompt = "> "
+	ta.ShowLineNumbers = false
+	ta.DynamicHeight = true
+	ta.MinHeight = 1
+	ta.MaxHeight = 5
+	// Rebind newline insertion off "enter" so plain enter can mean "send".
+	ta.KeyMap.InsertNewline = key.NewBinding(
+		key.WithKeys("ctrl+j", "alt+enter"),
+		key.WithHelp("ctrl+j", "newline"),
+	)
+	styles := ta.Styles()
+	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	styles.Focused.Text = lipgloss.NewStyle().Foreground(colorCream)
+	// Clear the default "highlight the line the cursor is on" — looks
+	// out of place in a chat input.
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	styles.Cursor.Color = colorAmber
+	ta.SetStyles(styles)
+	ta.Focus()
+	if width > 4 {
+		ta.SetWidth(width - 4)
+	}
+
 	return chatScreen{
 		width:    width,
 		height:   height,
+		input:    ta,
 		client:   c,
 		sub:      c.send,
 		messages: chatRoom.history(),
@@ -234,15 +271,25 @@ func chatWaitForMsg(sub chan chatMsg) tea.Cmd {
 // Init wires up the first chatWaitForMsg call. After this Bubble Tea has a
 // goroutine sitting in the channel receive; every time a message arrives
 // it lands in Update as a chatIncomingMsg.
+func (m chatScreen) title() string { return "chat" }
+
 func (m chatScreen) Init() tea.Cmd {
-	return chatWaitForMsg(m.sub)
+	// Batch lets us return multiple commands from one place — Bubble Tea
+	// will run them concurrently. We need both the chat receiver and the
+	// textarea's blink-loop kickoff. (The input itself was already focused
+	// in newChatScreen — see the comment there.)
+	return tea.Batch(chatWaitForMsg(m.sub), textarea.Blink)
 }
 
 func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
+	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.width > 4 {
+			m.input.SetWidth(m.width - 4)
+		}
 	case chatIncomingMsg:
 		// Append the incoming chat line and re-arm the receiver so the
 		// *next* message also reaches us.
@@ -262,8 +309,8 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			return m, func() tea.Msg { return ShowDirectoryMsg{} }
 		case "enter":
 			// `strings.TrimSpace` strips leading/trailing whitespace. Stdlib.
-			text := strings.TrimSpace(m.input)
-			m.input = ""
+			text := strings.TrimSpace(m.input.Value())
+			m.input.Reset()
 			if text == "" {
 				return m, nil
 			}
@@ -286,23 +333,16 @@ func (m chatScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				return m, nil
 			}
 			chatRoom.send(chatMsg{from: m.client.displayName(), text: text})
-		case "backspace":
-			if len(m.input) > 0 {
-				// Slice expression dropping the last byte. NB: this is
-				// byte-oriented, so it would eat the wrong amount off a
-				// multi-byte rune. Fine for ASCII; would need `utf8` for
-				// correct Unicode behaviour.
-				m.input = m.input[:len(m.input)-1]
-			}
-		default:
-			// Any printable text — single character or multi-rune paste — comes
-			// through here. msg.Text is empty for purely non-text keys.
-			if msg.Text != "" {
-				m.input += msg.Text
-			}
+			return m, nil
 		}
 	}
-	return m, nil
+	// Anything else (typing chars, backspace, cursor moves, paste, cursor
+	// blink ticks) goes through textinput. It returns an updated Model
+	// and an optional Cmd we need to forward.
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	cmds = append(cmds, cmd)
+	return m, tea.Batch(cmds...)
 }
 
 func (m chatScreen) View() string {
@@ -311,8 +351,6 @@ func (m chatScreen) View() string {
 		chatWidth = 20
 	}
 
-	inputStyle := lipgloss.NewStyle().Foreground(colorCream)
-	promptStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
 	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true)
 	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
 	msgStyle := lipgloss.NewStyle().Foreground(colorCream)
@@ -320,10 +358,11 @@ func (m chatScreen) View() string {
 
 	wrap := lipgloss.NewStyle().Width(chatWidth)
 
-	// Render the input first so we can measure its height. The chat area
-	// shrinks as the input grows so the whole layout still fits the terminal.
-	input := wrap.Render(promptStyle.Render("> ") + inputStyle.Render(m.input+"█"))
-	inputHeight := strings.Count(input, "\n") + 1
+	// textarea wraps soft lines and grows vertically as the user types
+	// (capped by MaxHeight, configured in newChatScreen). We query its
+	// current height so the chat log can shrink to make room.
+	input := m.input.View()
+	inputHeight := m.input.Height()
 
 	chatHeight := m.height - 4 - inputHeight
 	if chatHeight < 1 {
@@ -380,6 +419,8 @@ func (m chatScreen) View() string {
 				"/help          show this help\n" +
 				"/exit          leave the chatroom\n" +
 				"esc            leave the chatroom\n" +
+				"enter          send\n" +
+				"ctrl+j         insert a newline\n" +
 				"ctrl+c         disconnect\n\n" +
 				lipgloss.NewStyle().Foreground(colorAmberDim).Render("press any key to close"),
 		)
@@ -410,6 +451,8 @@ type fullScreen struct {
 func newFullScreen(width, height int) Screen {
 	return fullScreen{width: width, height: height}
 }
+
+func (s fullScreen) title() string { return "full" }
 
 func (s fullScreen) Init() tea.Cmd { return nil }
 

@@ -2,13 +2,17 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"math/rand"
 	"strings"
 	"sync"
+	"time"
 
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/ssh"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 // ----------------------------------------------------------------------------
@@ -33,6 +37,35 @@ const (
 	worldWidth     = 120
 	worldHeight    = 60
 	gameMaxPlayers = 20
+	bubbleDuration = 4 * time.Second
+	bubbleCharCap  = 60
+	nickCharCap    = 16
+)
+
+// inputMode enumerates the screen's keyboard modes. `iota` gives each
+// constant a successive integer value starting at 0; defining a named
+// type makes them distinct from plain ints so we can't accidentally pass
+// an arbitrary number where a mode is expected.
+type inputMode int
+
+const (
+	inputModeMove   inputMode = iota // arrow keys drive the player
+	inputModeSpeak                   // typing into a speech bubble
+	inputModeRename                  // typing a new nickname
+)
+
+// Game-only palette. The amber-monochrome theme from theme.go works for
+// text screens but flattens out an environment with grass / trees / water,
+// so the game uses its own colours. The 256-colour indices below correspond
+// to roughly: muted green, dark green, steel blue, bright white, and a
+// medium grey.
+var (
+	colorGrass       = lipgloss.Color("22")  // grass — deep dim green (recedes)
+	colorTree        = lipgloss.Color("130") // trees — rust brown (contrasts)
+	colorWater       = lipgloss.Color("67")  // water — steel blue
+	colorPlayerSelf  = lipgloss.Color("15")  // your @ — white
+	colorPlayerOther = lipgloss.Color("245") // other players' @ — grey
+	colorNameplate   = lipgloss.Color("141") // nameplates — soft lavender (UI, not world)
 )
 
 type tile rune
@@ -94,11 +127,16 @@ func carveLake(w [][]tile, cx, cy, rx, ry int) {
 // gamePlayer is the per-session state. We use *gamePlayer (pointer values)
 // as identity throughout — two players with the same nick are still
 // distinct pointers, so they don't clash as map keys.
+//
+// `message` and `messageExpires` track the currently-floating speech bubble.
+// They live under the game's mutex with the rest of the player fields.
 type gamePlayer struct {
-	send chan gameSnapshot
-	ip   string
-	nick string
-	x, y int
+	send           chan gameSnapshot
+	ip             string
+	nick           string
+	x, y           int
+	message        string
+	messageExpires time.Time
 }
 
 func (p *gamePlayer) displayName() string {
@@ -112,8 +150,10 @@ func (p *gamePlayer) displayName() string {
 // in time. The broadcast snapshots build these so receivers don't hold
 // references to *gamePlayer fields, which the hub mutates under its lock.
 type gamePlayerInfo struct {
-	name string
-	x, y int
+	name           string
+	x, y           int
+	message        string
+	messageExpires time.Time
 }
 
 // gameSnapshot is the message broadcast to every player after each state
@@ -225,9 +265,74 @@ func (g *game) snapshot() gameSnapshot {
 func (g *game) buildSnapshot() gameSnapshot {
 	snap := make(gameSnapshot, len(g.players))
 	for p := range g.players {
-		snap[p] = gamePlayerInfo{name: p.displayName(), x: p.x, y: p.y}
+		snap[p] = gamePlayerInfo{
+			name:           p.displayName(),
+			x:              p.x,
+			y:              p.y,
+			message:        p.message,
+			messageExpires: p.messageExpires,
+		}
 	}
 	return snap
+}
+
+// rename updates a player's nick (persists across reconnects via the
+// shared nicks map from chat.go) and broadcasts so everyone's nameplates
+// refresh. Empty/whitespace-only names are ignored.
+func (g *game) rename(p *gamePlayer, newNick string) {
+	newNick = strings.TrimSpace(newNick)
+	if newNick == "" {
+		return
+	}
+	// setNick uses its own mutex; call it before taking g.mu so we don't
+	// hold two locks at once. Slight inconsistency window (new joiners
+	// might see the new nick before existing players' snapshots refresh)
+	// is acceptable for the use case.
+	setNick(p.ip, newNick)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return
+	}
+	p.nick = newNick
+	g.broadcast()
+}
+
+// say sets the speaker's floating-bubble message, broadcasts the new state,
+// and schedules a background goroutine to clear the bubble after
+// bubbleDuration. The clearer only fires if no newer message has been
+// said in the meantime (checked via messageExpires equality).
+func (g *game) say(p *gamePlayer, msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	g.mu.Lock()
+	if _, ok := g.players[p]; !ok {
+		g.mu.Unlock()
+		return
+	}
+	p.message = msg
+	p.messageExpires = time.Now().Add(bubbleDuration)
+	expires := p.messageExpires
+	g.broadcast()
+	g.mu.Unlock()
+
+	go func() {
+		time.Sleep(bubbleDuration + 10*time.Millisecond)
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if _, ok := g.players[p]; !ok {
+			return
+		}
+		// Only clear if the expiry we scheduled is still the active one.
+		// A newer say() would have replaced it with a later time.
+		if p.messageExpires.Equal(expires) {
+			p.message = ""
+			g.broadcast()
+		}
+	}()
 }
 
 // broadcast snapshots state and pushes it to every player's send channel.
@@ -261,6 +366,8 @@ type gameScreen struct {
 	height   int
 	player   *gamePlayer
 	snapshot gameSnapshot
+	mode     inputMode       // current keyboard mode (move / speak / rename)
+	input    textinput.Model // shared input widget for speak and rename modes
 }
 
 func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
@@ -281,13 +388,27 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 		<-s.Context().Done()
 		theGame.leave(p)
 	}()
+
+	// Shared input widget used for speech bubbles and renames. Width and
+	// CharLimit are reconfigured per-mode when the player enters one. Not
+	// focused until the player presses 't' (speak) or 'n' (rename).
+	ti := textinput.New()
+	ti.Prompt = ""
+	styles := ti.Styles()
+	styles.Focused.Text = lipgloss.NewStyle().Foreground(colorCream)
+	styles.Cursor.Color = colorAmber
+	ti.SetStyles(styles)
+
 	return gameScreen{
 		width:    width,
 		height:   height,
 		player:   p,
 		snapshot: theGame.snapshot(),
+		input:    ti,
 	}
 }
+
+func (m gameScreen) title() string { return "game" }
 
 func (m gameScreen) Init() tea.Cmd {
 	return gameWaitForSnap(m.player.send)
@@ -304,10 +425,54 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		m.snapshot = gameSnapshot(msg)
 		return m, gameWaitForSnap(m.player.send)
 	case tea.KeyPressMsg:
+		// Non-move-mode key handling takes precedence: while composing,
+		// almost every key goes into the input rather than the movement
+		// system. Esc cancels, enter commits the appropriate action.
+		if m.mode != inputModeMove {
+			switch msg.String() {
+			case "esc":
+				m.mode = inputModeMove
+				m.input.Reset()
+				m.input.Blur()
+				return m, nil
+			case "enter":
+				text := m.input.Value()
+				mode := m.mode
+				m.mode = inputModeMove
+				m.input.Reset()
+				m.input.Blur()
+				switch mode {
+				case inputModeSpeak:
+					theGame.say(m.player, text)
+				case inputModeRename:
+					theGame.rename(m.player, text)
+				}
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		}
+		// Movement mode.
 		switch msg.String() {
 		case "esc", "q":
 			theGame.leave(m.player)
 			return m, func() tea.Msg { return ShowDirectoryMsg{} }
+		case "t":
+			m.mode = inputModeSpeak
+			m.input.CharLimit = bubbleCharCap
+			m.input.SetWidth(bubbleCharCap)
+			return m, m.input.Focus()
+		case "n":
+			m.mode = inputModeRename
+			m.input.CharLimit = nickCharCap
+			m.input.SetWidth(nickCharCap)
+			// Pre-fill with the current nick (if any) so the user can edit
+			// rather than retype. getNick reads under its own mutex, safe
+			// to call here.
+			m.input.SetValue(getNick(m.player.ip))
+			m.input.CursorEnd()
+			return m, m.input.Focus()
 		case "up", "k", "w":
 			theGame.move(m.player, 0, -1)
 		case "down", "j", "s":
@@ -317,6 +482,14 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		case "right", "l", "d":
 			theGame.move(m.player, 1, 0)
 		}
+	}
+	// Forward any unhandled message (e.g. cursor blink ticks while a
+	// non-move mode is active) to the textinput so its internal state
+	// keeps ticking.
+	if m.mode != inputModeMove {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return m, cmd
 	}
 	return m, nil
 }
@@ -364,11 +537,15 @@ func (m gameScreen) View() string {
 		camY = 0
 	}
 
-	grassStyle := lipgloss.NewStyle().Foreground(colorAmberDim)
-	treeStyle := lipgloss.NewStyle().Foreground(colorCream)
-	waterStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Faint(true)
-	selfStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
-	otherStyle := lipgloss.NewStyle().Foreground(colorCream).Bold(true)
+	// Cell styles. These are ultraviolet styles (the lower-level type that
+	// Lip Gloss v2's Canvas operates on) rather than lipgloss.Style — we're
+	// going under Lip Gloss for direct cell access. `Attrs` is a bitfield
+	// of `uv.AttrBold | uv.AttrFaint | ...`.
+	treeStyle := uv.Style{Fg: colorTree}
+	waterStyle := uv.Style{Fg: colorWater}
+	grassStyle := uv.Style{Fg: colorGrass}
+	selfStyle := uv.Style{Fg: colorPlayerSelf, Attrs: uv.AttrBold}
+	otherStyle := uv.Style{Fg: colorPlayerOther, Attrs: uv.AttrBold}
 
 	// Index other players by world coord so the per-tile loop below is an
 	// O(1) lookup instead of a linear scan through the snapshot.
@@ -380,45 +557,208 @@ func (m gameScreen) View() string {
 		others[[2]int{info.x, info.y}] = info
 	}
 
-	rows := make([]string, viewportTilesH)
+	// Build the viewport on a Lip Gloss Canvas: a 2D buffer of styled
+	// cells. We set each tile's two cells directly rather than building
+	// a string with embedded ANSI per glyph — Bubble Tea's renderer can
+	// then diff the buffer against the previous frame and only emit the
+	// cells that actually changed.
+	canvas := lipgloss.NewCanvas(m.width, viewportH)
 	for y := 0; y < viewportTilesH; y++ {
-		var row strings.Builder
-		for x := 0; x < viewportTilesW; x++ {
-			wx, wy := camX+x, camY+y
+		for tx := 0; tx < viewportTilesW; tx++ {
+			wx, wy := camX+tx, camY+y
+			cx := tx * 2 // left cell of this 2-wide tile
+
+			// Out-of-world: leave the canvas's default blank cell in place.
 			if wx < 0 || wx >= worldWidth || wy < 0 || wy >= worldHeight {
-				row.WriteString("  ")
 				continue
 			}
-			if wx == me.x && wy == me.y {
-				row.WriteString(selfStyle.Render("@ "))
-				continue
-			}
-			if _, isOther := others[[2]int{wx, wy}]; isOther {
-				row.WriteString(otherStyle.Render("@ "))
-				continue
-			}
-			switch world[wy][wx] {
-			case tileTree:
-				row.WriteString(treeStyle.Render("T "))
-			case tileWater:
-				row.WriteString(waterStyle.Render("~~"))
+
+			var left, right *uv.Cell
+			switch {
+			case wx == me.x && wy == me.y:
+				left = &uv.Cell{Content: "@", Width: 1, Style: selfStyle}
+				right = &uv.Cell{Content: " ", Width: 1}
+			case othersContains(others, wx, wy):
+				left = &uv.Cell{Content: "@", Width: 1, Style: otherStyle}
+				right = &uv.Cell{Content: " ", Width: 1}
 			default:
-				row.WriteString(grassStyle.Render(". "))
+				switch world[wy][wx] {
+				case tileTree:
+					left = &uv.Cell{Content: "T", Width: 1, Style: treeStyle}
+					right = &uv.Cell{Content: " ", Width: 1}
+				case tileWater:
+					left = &uv.Cell{Content: "~", Width: 1, Style: waterStyle}
+					right = &uv.Cell{Content: "~", Width: 1, Style: waterStyle}
+				default:
+					left = &uv.Cell{Content: ".", Width: 1, Style: grassStyle}
+					right = &uv.Cell{Content: " ", Width: 1}
+				}
 			}
+			canvas.SetCell(cx, y, left)
+			canvas.SetCell(cx+1, y, right)
 		}
-		rows[y] = row.String()
 	}
 
 	statusLine := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render("game test") +
 		lipgloss.NewStyle().Foreground(colorAmberDim).Render(
 			fmt.Sprintf("  %d players · pos (%d, %d)", len(m.snapshot), me.x, me.y),
 		)
-	help := lipgloss.NewStyle().Foreground(colorAmberDim).
-		Render("arrows / wasd / hjkl to move · esc to leave")
+	var helpText string
+	switch m.mode {
+	case inputModeSpeak:
+		helpText = "enter to send · esc to cancel"
+	case inputModeRename:
+		helpText = "type a name · enter to set · esc to cancel"
+	default:
+		helpText = "arrows / wasd / hjkl to move · t to say · n to rename · esc to leave"
+	}
+	help := lipgloss.NewStyle().Foreground(colorAmberDim).Render(helpText)
 
-	out := make([]string, 0, viewportTilesH+2)
-	out = append(out, statusLine)
-	out = append(out, rows...)
-	out = append(out, help)
-	return strings.Join(out, "\n")
+	base := strings.Join([]string{statusLine, canvas.Render(), help}, "\n")
+
+	// Collect every bubble we need to overlay: live messages from any
+	// player whose expiry is still in the future, plus the local player's
+	// in-progress textinput if they're composing or renaming.
+	//
+	// `border` controls the bubble's border colour — amber for speech,
+	// lavender for renames — which gives the user a visual cue about
+	// which mode they're in (it also matches the nameplate colour for
+	// the rename case, since renaming literally edits a nameplate).
+	type bubbleSpec struct {
+		x, y   int
+		text   string
+		border color.Color
+	}
+	var bubbles []bubbleSpec
+	now := time.Now()
+	for p, info := range m.snapshot {
+		// Skip our own message if we're typing — the live input bubble
+		// below replaces it. Also skip empty/expired messages.
+		if p == m.player && m.mode != inputModeMove {
+			continue
+		}
+		if info.message == "" || !info.messageExpires.After(now) {
+			continue
+		}
+		bubbles = append(bubbles, bubbleSpec{
+			x: info.x, y: info.y, text: info.message, border: colorAmber,
+		})
+	}
+	if m.mode != inputModeMove {
+		border := colorAmber
+		if m.mode == inputModeRename {
+			border = colorNameplate
+		}
+		bubbles = append(bubbles, bubbleSpec{
+			x: me.x, y: me.y, text: m.input.View(), border: border,
+		})
+	}
+
+	// Build a Compositor: the rendered base text becomes the bottom layer.
+	// On top we add a persistent nameplate per player, then any active
+	// speech bubbles (which will sit visually on top of nameplates when
+	// both occupy the same cells — compositor z-order is insertion order).
+	//
+	// Layout per bubble: 1 top border + 1 content line + 1 bottom border +
+	// 1 tail row = 4 rows total. Text never wraps because we don't set a
+	// Width on the bubble's style, so this stays constant.
+	layers := []*lipgloss.Layer{lipgloss.NewLayer(base)}
+	const (
+		canvasOffsetY = 1 // base rows: [0] status, [1..] canvas
+		bubbleH       = 4
+	)
+
+	// onScreen reports whether a world tile is inside the current viewport.
+	onScreen := func(x, y int) bool {
+		return x >= camX && x < camX+viewportTilesW &&
+			y >= camY && y < camY+viewportTilesH
+	}
+
+	// Nameplates: one row above each on-screen player's @, centred on it.
+	// Uses a soft lavender so they read as UI rather than part of the world.
+	nameStyle := lipgloss.NewStyle().Foreground(colorNameplate)
+	for _, info := range m.snapshot {
+		if info.name == "" || !onScreen(info.x, info.y) {
+			continue
+		}
+		playerCol := (info.x - camX) * 2
+		playerRow := canvasOffsetY + (info.y - camY)
+		// Prefer above the player, flip below if at the top of the canvas.
+		nameRow := playerRow - 1
+		if nameRow < canvasOffsetY {
+			nameRow = playerRow + 1
+		}
+		plate := nameStyle.Render(info.name)
+		plateW := lipgloss.Width(plate)
+		plateX := playerCol - (plateW-1)/2
+		if plateX < 0 {
+			plateX = 0
+		}
+		if plateX+plateW > m.width {
+			plateX = m.width - plateW
+		}
+		layers = append(layers, lipgloss.NewLayer(plate).X(plateX).Y(nameRow))
+	}
+
+	for _, b := range bubbles {
+		if !onScreen(b.x, b.y) {
+			continue
+		}
+		// Player's left cell on the canvas, then in compositor coords:
+		playerCol := (b.x - camX) * 2
+		playerRow := canvasOffsetY + (b.y - camY)
+		// If the bubble fits above the player without spilling off the
+		// top of the screen, point down at them. Otherwise flip below.
+		roomAbove := playerRow >= bubbleH
+		bubble, tailCol := renderBubble(b.text, roomAbove, b.border)
+		var bubbleY int
+		if roomAbove {
+			bubbleY = playerRow - bubbleH
+		} else {
+			bubbleY = playerRow + 1
+		}
+		// Anchor the bubble so the tail sits in the same column as the
+		// player's "@" glyph.
+		bubbleX := playerCol - tailCol
+		// Clip horizontally so we never produce out-of-bounds coordinates.
+		if bubbleX < 0 {
+			bubbleX = 0
+		}
+		if bw := lipgloss.Width(bubble); bubbleX+bw > m.width {
+			bubbleX = m.width - bw
+			if bubbleX < 0 {
+				bubbleX = 0
+			}
+		}
+		layers = append(layers, lipgloss.NewLayer(bubble).X(bubbleX).Y(bubbleY))
+	}
+	return lipgloss.NewCompositor(layers...).Render()
+}
+
+// renderBubble draws a single speech-style bubble around `text`. tailDown
+// flips between bubble-above-speaker (tail points down) and below (tail
+// points up). border selects the border + tail colour (amber for speech,
+// lavender for renames). The second return is the column index of the
+// tail glyph, used by the caller to align it over the speaker.
+func renderBubble(text string, tailDown bool, border color.Color) (string, int) {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1).
+		Foreground(colorCream).
+		Render(text)
+	boxW := lipgloss.Width(box)
+	tailCol := boxW / 2
+	tail := lipgloss.NewStyle().Foreground(border)
+	if tailDown {
+		return box + "\n" + strings.Repeat(" ", tailCol) + tail.Render("v"), tailCol
+	}
+	return strings.Repeat(" ", tailCol) + tail.Render("^") + "\n" + box, tailCol
+}
+
+// othersContains keeps the type-switch in View readable — Go doesn't have
+// a one-liner for "is this key in this map?" without the value.
+func othersContains(m map[[2]int]gamePlayerInfo, x, y int) bool {
+	_, ok := m[[2]int{x, y}]
+	return ok
 }

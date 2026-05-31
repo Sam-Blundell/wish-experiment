@@ -22,6 +22,8 @@ func newWelcomeScreen() welcomeScreen {
 	return welcomeScreen{}
 }
 
+func (s welcomeScreen) title() string { return "welcome" }
+
 // Init runs once when the screen becomes active. We have nothing to do at
 // startup, so we return `nil` — the Bubble Tea convention for "no command".
 func (s welcomeScreen) Init() tea.Cmd { return nil }

@@ -19,6 +19,8 @@ func newAboutScreen(width, height int) aboutScreen {
 	return aboutScreen{width: width, height: height}
 }
 
+func (s aboutScreen) title() string { return "about" }
+
 func (s aboutScreen) Init() tea.Cmd { return nil }
 
 func (s aboutScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
