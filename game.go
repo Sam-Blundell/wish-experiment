@@ -56,13 +56,13 @@ const (
 
 // Game-only palette. The amber-monochrome theme from theme.go works for
 // text screens but flattens out an environment with grass / trees / water,
-// so the game uses its own colours. The 256-colour indices below correspond
-// to roughly: muted green, dark green, steel blue, bright white, and a
-// medium grey.
+// so the game uses its own colours.
 var (
 	colorGrass       = lipgloss.Color("22")  // grass — deep dim green (recedes)
 	colorTree        = lipgloss.Color("130") // trees — rust brown (contrasts)
 	colorWater       = lipgloss.Color("67")  // water — steel blue
+	colorWall        = lipgloss.Color("240") // walls — dim grey stone
+	colorFloor       = lipgloss.Color("137") // interior floor — warm wood
 	colorPlayerSelf  = lipgloss.Color("15")  // your @ — white
 	colorPlayerOther = lipgloss.Color("245") // other players' @ — grey
 	colorNameplate   = lipgloss.Color("141") // nameplates — soft lavender (UI, not world)
@@ -74,51 +74,186 @@ const (
 	tileGrass tile = '.'
 	tileTree  tile = 'T'
 	tileWater tile = '~'
+	tileWall  tile = '#' // interior + exterior walls — not walkable
+	tileFloor tile = ',' // interior floor — walkable
+	tileDoor  tile = '/' // walking *into* one teleports between worlds
 )
 
+// walkable says whether the player can step onto this tile via normal
+// movement. Door tiles are deliberately excluded: stepping into a door
+// triggers a teleport in move() instead of standing on it.
 func (t tile) walkable() bool {
-	return t != tileTree && t != tileWater
+	switch t {
+	case tileTree, tileWater, tileWall, tileDoor:
+		return false
+	}
+	return true
 }
 
-// world is the shared map data. It's generated once at startup (because
-// it's assigned at package level) and never mutated, so any goroutine can
-// read from it without locking.
-var world = generateWorld()
+// worldGrid is one game cell — a grid of tiles plus its dimensions and the
+// list of doors that lead out of it. The outdoor world is one of these;
+// each interior (a house, a cave, eventually a dungeon room) is another.
+//
+// `floor` is the tile the world considers its natural walkable surface
+// (grass outdoors, wood-floor in the house). Doors render as this tile so
+// they read as gaps rather than special-looking glyphs.
+type worldGrid struct {
+	tiles  [][]tile
+	width  int
+	height int
+	floor  tile
+	doors  []door
+}
 
-func generateWorld() [][]tile {
+// door pins a door tile to its target. Stepping into (x, y) on this world
+// teleports the player to (target.x, target.y) in worlds[target.worldID].
+type door struct {
+	x, y   int
+	target doorTarget
+}
+
+type doorTarget struct {
+	worldID int
+	x, y    int
+}
+
+// doorAt returns the target for the door at (x, y) if one is registered.
+// Worlds typically have one or two doors, so a linear scan is fine.
+func (w *worldGrid) doorAt(x, y int) (doorTarget, bool) {
+	for _, d := range w.doors {
+		if d.x == x && d.y == y {
+			return d.target, true
+		}
+	}
+	return doorTarget{}, false
+}
+
+// World IDs. Players spawn in worldOutdoor and can warp to worldHouse by
+// walking into the house's door tile.
+const (
+	worldOutdoor = 0
+	worldHouse   = 1
+)
+
+// worlds is the slice of all game cells. Generated once at startup —
+// never mutated, so any goroutine can read from any world without
+// locking. Doors are wired up after both worlds exist so each can
+// reference the other.
+var worlds = func() []*worldGrid {
+	outdoor := generateOutdoor()
+	house := generateHouse()
+
+	// Outdoor house at (60, 30): top-left of its 5×3 footprint. The door
+	// is at the south face. Stepping into that door drops the player one
+	// row above the interior door (facing into the room); stepping into
+	// the interior door drops them one row below the outdoor door so we
+	// don't immediately re-trigger the teleport.
+	// House sits to the upper-right of the world's centre — far enough
+	// that you have to walk a bit from spawn to find it, but well clear
+	// of the edges and both lakes.
+	const (
+		houseWide, houseTall = 5, 3
+		houseX, houseY       = 80, 18
+		outDoorX             = houseX + houseWide/2 // 82
+		outDoorY             = houseY + houseTall - 1 // 20
+		inDoorX, inDoorY     = 9, 11 // bottom-centre of the 18×12 interior
+	)
+	placeHouse(outdoor, houseX, houseY, houseWide, houseTall)
+	outdoor.doors = []door{{
+		x: outDoorX, y: outDoorY,
+		target: doorTarget{worldID: worldHouse, x: inDoorX, y: inDoorY - 1},
+	}}
+	house.doors = []door{{
+		x: inDoorX, y: inDoorY,
+		target: doorTarget{worldID: worldOutdoor, x: outDoorX, y: outDoorY + 1},
+	}}
+
+	return []*worldGrid{outdoor, house}
+}()
+
+// generateOutdoor builds the open-air cell: grass with a tree border,
+// random tree clutter, and two circular lakes.
+func generateOutdoor() *worldGrid {
 	r := rand.New(rand.NewSource(42))
-	w := make([][]tile, worldHeight)
-	for y := range w {
-		w[y] = make([]tile, worldWidth)
-		for x := range w[y] {
-			w[y][x] = tileGrass
+	tiles := make([][]tile, worldHeight)
+	for y := range tiles {
+		tiles[y] = make([]tile, worldWidth)
+		for x := range tiles[y] {
+			tiles[y][x] = tileGrass
 		}
 	}
 	for x := 0; x < worldWidth; x++ {
-		w[0][x] = tileTree
-		w[worldHeight-1][x] = tileTree
+		tiles[0][x] = tileTree
+		tiles[worldHeight-1][x] = tileTree
 	}
 	for y := 0; y < worldHeight; y++ {
-		w[y][0] = tileTree
-		w[y][worldWidth-1] = tileTree
+		tiles[y][0] = tileTree
+		tiles[y][worldWidth-1] = tileTree
 	}
 	for i := 0; i < 250; i++ {
 		x := r.Intn(worldWidth-2) + 1
 		y := r.Intn(worldHeight-2) + 1
-		w[y][x] = tileTree
+		tiles[y][x] = tileTree
 	}
+	w := &worldGrid{tiles: tiles, width: worldWidth, height: worldHeight, floor: tileGrass}
 	carveLake(w, worldWidth/3, worldHeight/3, 4, 4)
 	carveLake(w, 3*worldWidth/4, 2*worldHeight/3, 5, 5)
 	return w
 }
 
-func carveLake(w [][]tile, cx, cy, rx, ry int) {
-	for y := 1; y < worldHeight-1; y++ {
-		for x := 1; x < worldWidth-1; x++ {
+// generateHouse builds the interior cell: an 18×12 stone-walled room with
+// a wood floor. The bottom-centre wall tile is replaced with floor (the
+// "door") so it reads as a gap when rendered; the teleport hook on that
+// position is registered by the worlds initialiser.
+func generateHouse() *worldGrid {
+	const (
+		hw = 18
+		hh = 12
+	)
+	tiles := make([][]tile, hh)
+	for y := range tiles {
+		tiles[y] = make([]tile, hw)
+		for x := range tiles[y] {
+			if y == 0 || y == hh-1 || x == 0 || x == hw-1 {
+				tiles[y][x] = tileWall
+			} else {
+				tiles[y][x] = tileFloor
+			}
+		}
+	}
+	// Door: just a missing wall section. The teleport behaviour is
+	// attached to this position by the worlds initialiser.
+	tiles[hh-1][hw/2] = tileFloor
+	return &worldGrid{tiles: tiles, width: hw, height: hh, floor: tileFloor}
+}
+
+// placeHouse stamps an wide×tall building onto the outdoor world at
+// (x, y). Walls everywhere except the bottom-centre tile, which becomes
+// a door tile (its target is wired up by the worlds initialiser). The
+// tile directly south of the door is forced to grass so the teleport-out
+// landing spot is always walkable, even if random tree placement put
+// something there.
+func placeHouse(w *worldGrid, x, y, wide, tall int) {
+	for dy := 0; dy < tall; dy++ {
+		for dx := 0; dx < wide; dx++ {
+			w.tiles[y+dy][x+dx] = tileWall
+		}
+	}
+	doorX := x + wide/2
+	doorY := y + tall - 1
+	w.tiles[doorY][doorX] = tileDoor
+	if doorY+1 < w.height {
+		w.tiles[doorY+1][doorX] = tileGrass
+	}
+}
+
+func carveLake(w *worldGrid, cx, cy, rx, ry int) {
+	for y := 1; y < w.height-1; y++ {
+		for x := 1; x < w.width-1; x++ {
 			dx := float64(x - cx)
 			dy := float64(y - cy)
 			if dx*dx/float64(rx*rx)+dy*dy/float64(ry*ry) < 1 {
-				w[y][x] = tileWater
+				w.tiles[y][x] = tileWater
 			}
 		}
 	}
@@ -134,6 +269,7 @@ type gamePlayer struct {
 	send           chan gameSnapshot
 	ip             string
 	nick           string
+	worldID        int // which world the player is currently in
 	x, y           int
 	message        string
 	messageExpires time.Time
@@ -151,6 +287,7 @@ func (p *gamePlayer) displayName() string {
 // references to *gamePlayer fields, which the hub mutates under its lock.
 type gamePlayerInfo struct {
 	name           string
+	worldID        int
 	x, y           int
 	message        string
 	messageExpires time.Time
@@ -188,24 +325,30 @@ func (g *game) join(p *gamePlayer) bool {
 	return true
 }
 
-// placeSpawn finds an unoccupied walkable tile starting near the world
-// centre and expanding outward, then sets it on p. Caller holds g.mu.
+// placeSpawn finds an unoccupied walkable tile in the outdoor world near
+// its centre and assigns it to p. Caller holds g.mu.
 func (g *game) placeSpawn(p *gamePlayer) bool {
-	// Build a quick lookup of currently-occupied tiles. `[2]int` is a
-	// fixed-size array (not a slice), and arrays are comparable in Go,
-	// which makes them valid map keys — useful for "set of coordinates".
+	p.worldID = worldOutdoor
+	w := worlds[worldOutdoor]
+
+	// Build a quick lookup of currently-occupied tiles in this world.
+	// `[2]int` is a fixed-size array (not a slice), and arrays are
+	// comparable in Go, which makes them valid map keys — useful for
+	// "set of coordinates".
 	occupied := make(map[[2]int]bool, len(g.players))
 	for other := range g.players {
-		occupied[[2]int{other.x, other.y}] = true
+		if other.worldID == worldOutdoor {
+			occupied[[2]int{other.x, other.y}] = true
+		}
 	}
-	cx, cy := worldWidth/2, worldHeight/2
-	for r := 0; r < worldWidth; r++ {
+	cx, cy := w.width/2, w.height/2
+	for r := 0; r < w.width; r++ {
 		for y := cy - r; y <= cy+r; y++ {
 			for x := cx - r; x <= cx+r; x++ {
-				if y < 0 || y >= worldHeight || x < 0 || x >= worldWidth {
+				if y < 0 || y >= w.height || x < 0 || x >= w.width {
 					continue
 				}
-				if !world[y][x].walkable() {
+				if !w.tiles[y][x].walkable() {
 					continue
 				}
 				if occupied[[2]int{x, y}] {
@@ -233,21 +376,48 @@ func (g *game) leave(p *gamePlayer) {
 
 // move validates the requested step and applies it if legal. Players
 // can't walk through tiles that aren't walkable or onto another player.
+// Stepping into a door tile teleports the player to the door's target.
 func (g *game) move(p *gamePlayer, dx, dy int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if _, ok := g.players[p]; !ok {
 		return
 	}
+	w := worlds[p.worldID]
 	nx, ny := p.x+dx, p.y+dy
-	if nx < 0 || nx >= worldWidth || ny < 0 || ny >= worldHeight {
+	if nx < 0 || nx >= w.width || ny < 0 || ny >= w.height {
 		return
 	}
-	if !world[ny][nx].walkable() {
+
+	// Door: walking into one warps the player to its target. Doors are
+	// not "walkable" in the normal sense — we handle them first, before
+	// the walkability check below.
+	if target, ok := w.doorAt(nx, ny); ok {
+		dest := worlds[target.worldID]
+		if target.x < 0 || target.x >= dest.width ||
+			target.y < 0 || target.y >= dest.height ||
+			!dest.tiles[target.y][target.x].walkable() {
+			return
+		}
+		for other := range g.players {
+			if other != p && other.worldID == target.worldID &&
+				other.x == target.x && other.y == target.y {
+				return
+			}
+		}
+		p.worldID = target.worldID
+		p.x = target.x
+		p.y = target.y
+		g.broadcast()
+		return
+	}
+
+	if !w.tiles[ny][nx].walkable() {
 		return
 	}
 	for other := range g.players {
-		if other != p && other.x == nx && other.y == ny {
+		if other != p && other.worldID == p.worldID &&
+			other.x == nx && other.y == ny {
 			return
 		}
 	}
@@ -267,6 +437,7 @@ func (g *game) buildSnapshot() gameSnapshot {
 	for p := range g.players {
 		snap[p] = gamePlayerInfo{
 			name:           p.displayName(),
+			worldID:        p.worldID,
 			x:              p.x,
 			y:              p.y,
 			message:        p.message,
@@ -513,28 +684,44 @@ func (m gameScreen) View() string {
 	// reading them outside the lock would be a data race. The snapshot is
 	// a captured copy, so it's safe to read.
 	me := m.snapshot[m.player]
+	curWorld := worlds[me.worldID]
 
 	const statusH, helpH = 1, 1
 	viewportH := m.height - statusH - helpH
 	viewportTilesW := m.width / 2
 	viewportTilesH := viewportH
 
-	// Camera centred on the local player, clamped to the world. Far-edge
-	// clamps come first so the >=0 clamp wins when the viewport is bigger
-	// than the world (see game.go's earlier panic for the cautionary tale).
+	// Camera centred on the local player, clamped to the current world.
+	// Far-edge clamps come first so the >=0 clamp wins when the viewport
+	// is bigger than the world (which happens easily for the small
+	// interior cell).
 	camX := me.x - viewportTilesW/2
 	camY := me.y - viewportTilesH/2
-	if camX > worldWidth-viewportTilesW {
-		camX = worldWidth - viewportTilesW
+	if camX > curWorld.width-viewportTilesW {
+		camX = curWorld.width - viewportTilesW
 	}
-	if camY > worldHeight-viewportTilesH {
-		camY = worldHeight - viewportTilesH
+	if camY > curWorld.height-viewportTilesH {
+		camY = curWorld.height - viewportTilesH
 	}
 	if camX < 0 {
 		camX = 0
 	}
 	if camY < 0 {
 		camY = 0
+	}
+
+	// When a world is smaller than the viewport, the camera clamps to 0
+	// above — but that leaves the world rendered against the top-left
+	// corner. Compute a per-axis offset in tile-units so we instead draw
+	// it centred on the screen. For larger worlds these stay zero and
+	// nothing changes from the previous behaviour.
+	worldOffsetTilesX := 0
+	worldOffsetTilesY := 0
+	if curWorld.width < viewportTilesW {
+		worldOffsetTilesX = (viewportTilesW - curWorld.width) / 2
+	}
+	if curWorld.height < viewportTilesH {
+		worldOffsetTilesY = (viewportTilesH - curWorld.height) / 2
 	}
 
 	// Cell styles. These are ultraviolet styles (the lower-level type that
@@ -544,14 +731,18 @@ func (m gameScreen) View() string {
 	treeStyle := uv.Style{Fg: colorTree}
 	waterStyle := uv.Style{Fg: colorWater}
 	grassStyle := uv.Style{Fg: colorGrass}
+	wallStyle := uv.Style{Fg: colorWall}
+	floorStyle := uv.Style{Fg: colorFloor}
 	selfStyle := uv.Style{Fg: colorPlayerSelf, Attrs: uv.AttrBold}
 	otherStyle := uv.Style{Fg: colorPlayerOther, Attrs: uv.AttrBold}
 
 	// Index other players by world coord so the per-tile loop below is an
-	// O(1) lookup instead of a linear scan through the snapshot.
+	// O(1) lookup instead of a linear scan through the snapshot. Only
+	// include players in the same world as us — we can't see into other
+	// cells.
 	others := make(map[[2]int]gamePlayerInfo, len(m.snapshot))
 	for p, info := range m.snapshot {
-		if p == m.player {
+		if p == m.player || info.worldID != me.worldID {
 			continue
 		}
 		others[[2]int{info.x, info.y}] = info
@@ -565,11 +756,16 @@ func (m gameScreen) View() string {
 	canvas := lipgloss.NewCanvas(m.width, viewportH)
 	for y := 0; y < viewportTilesH; y++ {
 		for tx := 0; tx < viewportTilesW; tx++ {
-			wx, wy := camX+tx, camY+y
+			// World coord = camera position + screen offset, minus the
+			// centring shift. When the world is bigger than the viewport
+			// the offset is zero and this reduces to the original calc.
+			wx := camX + tx - worldOffsetTilesX
+			wy := camY + y - worldOffsetTilesY
 			cx := tx * 2 // left cell of this 2-wide tile
 
-			// Out-of-world: leave the canvas's default blank cell in place.
-			if wx < 0 || wx >= worldWidth || wy < 0 || wy >= worldHeight {
+			// Out-of-world (or in the blank "margin" around a small world):
+			// leave the canvas's default blank cell in place.
+			if wx < 0 || wx >= curWorld.width || wy < 0 || wy >= curWorld.height {
 				continue
 			}
 
@@ -582,13 +778,28 @@ func (m gameScreen) View() string {
 				left = &uv.Cell{Content: "@", Width: 1, Style: otherStyle}
 				right = &uv.Cell{Content: " ", Width: 1}
 			default:
-				switch world[wy][wx] {
+				switch curWorld.tiles[wy][wx] {
 				case tileTree:
 					left = &uv.Cell{Content: "T", Width: 1, Style: treeStyle}
 					right = &uv.Cell{Content: " ", Width: 1}
 				case tileWater:
 					left = &uv.Cell{Content: "~", Width: 1, Style: waterStyle}
 					right = &uv.Cell{Content: "~", Width: 1, Style: waterStyle}
+				case tileWall:
+					left = &uv.Cell{Content: "#", Width: 1, Style: wallStyle}
+					right = &uv.Cell{Content: "#", Width: 1, Style: wallStyle}
+				case tileFloor:
+					left = &uv.Cell{Content: ",", Width: 1, Style: floorStyle}
+					right = &uv.Cell{Content: " ", Width: 1}
+				case tileDoor:
+					// Render as the world's floor so the door reads as a
+					// gap in the wall. The teleport behaviour is unaffected.
+					if curWorld.floor == tileFloor {
+						left = &uv.Cell{Content: ",", Width: 1, Style: floorStyle}
+					} else {
+						left = &uv.Cell{Content: ".", Width: 1, Style: grassStyle}
+					}
+					right = &uv.Cell{Content: " ", Width: 1}
 				default:
 					left = &uv.Cell{Content: ".", Width: 1, Style: grassStyle}
 					right = &uv.Cell{Content: " ", Width: 1}
@@ -599,9 +810,20 @@ func (m gameScreen) View() string {
 		}
 	}
 
+	cellName := "outside"
+	if me.worldID == worldHouse {
+		cellName = "house"
+	}
+	// Count only players in our cell — the snapshot includes everyone.
+	visibleCount := 0
+	for _, info := range m.snapshot {
+		if info.worldID == me.worldID {
+			visibleCount++
+		}
+	}
 	statusLine := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render("game test") +
 		lipgloss.NewStyle().Foreground(colorAmberDim).Render(
-			fmt.Sprintf("  %d players · pos (%d, %d)", len(m.snapshot), me.x, me.y),
+			fmt.Sprintf("  [%s] %d here · pos (%d, %d)", cellName, visibleCount, me.x, me.y),
 		)
 	var helpText string
 	switch m.mode {
@@ -632,6 +854,10 @@ func (m gameScreen) View() string {
 	var bubbles []bubbleSpec
 	now := time.Now()
 	for p, info := range m.snapshot {
+		// Skip players in other worlds — speech doesn't carry between cells.
+		if info.worldID != me.worldID {
+			continue
+		}
 		// Skip our own message if we're typing — the live input bubble
 		// below replaces it. Also skip empty/expired messages.
 		if p == m.player && m.mode != inputModeMove {
@@ -676,13 +902,14 @@ func (m gameScreen) View() string {
 
 	// Nameplates: one row above each on-screen player's @, centred on it.
 	// Uses a soft lavender so they read as UI rather than part of the world.
+	// Only show plates for players in the same world as us.
 	nameStyle := lipgloss.NewStyle().Foreground(colorNameplate)
 	for _, info := range m.snapshot {
-		if info.name == "" || !onScreen(info.x, info.y) {
+		if info.worldID != me.worldID || info.name == "" || !onScreen(info.x, info.y) {
 			continue
 		}
-		playerCol := (info.x - camX) * 2
-		playerRow := canvasOffsetY + (info.y - camY)
+		playerCol := (info.x - camX + worldOffsetTilesX) * 2
+		playerRow := canvasOffsetY + (info.y - camY + worldOffsetTilesY)
 		// Prefer above the player, flip below if at the top of the canvas.
 		nameRow := playerRow - 1
 		if nameRow < canvasOffsetY {
@@ -704,9 +931,10 @@ func (m gameScreen) View() string {
 		if !onScreen(b.x, b.y) {
 			continue
 		}
-		// Player's left cell on the canvas, then in compositor coords:
-		playerCol := (b.x - camX) * 2
-		playerRow := canvasOffsetY + (b.y - camY)
+		// Player's left cell on the canvas, then in compositor coords.
+		// Apply the same centring offset used for the tile rendering.
+		playerCol := (b.x - camX + worldOffsetTilesX) * 2
+		playerRow := canvasOffsetY + (b.y - camY + worldOffsetTilesY)
 		// If the bubble fits above the player without spilling off the
 		// top of the screen, point down at them. Otherwise flip below.
 		roomAbove := playerRow >= bubbleH
