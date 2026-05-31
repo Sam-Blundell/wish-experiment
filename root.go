@@ -48,6 +48,7 @@ type Screen interface {
 type ShowDirectoryMsg struct{}
 type EnterChatMsg struct{}
 type EnterAboutMsg struct{}
+type EnterGameMsg struct{}
 
 // rootModel is the top-level Bubble Tea model. It holds whichever Screen
 // is currently active plus some shared session state, and forwards each
@@ -109,6 +110,9 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.active.Init()
 	case EnterAboutMsg:
 		m.active = newAboutScreen(m.width, m.height)
+		return m, m.active.Init()
+	case EnterGameMsg:
+		m.active = newGameScreen(m.session, m.ip, m.width, m.height)
 		return m, m.active.Init()
 	}
 
