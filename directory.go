@@ -22,8 +22,8 @@ type directoryScreen struct {
 
 func newDirectoryScreen(width, height int) directoryScreen {
 	return directoryScreen{
-		width:   width,
-		height:  height,
+		width:  width,
+		height: height,
 		// A slice literal — like a list/array in most languages.
 		options: []string{"testchat", "gametest", "about", "exit"},
 	}
