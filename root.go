@@ -149,6 +149,13 @@ func (m rootModel) View() tea.View {
 	v.AltScreen = true
 	v.Cursor = nil
 	v.BackgroundColor = colorVoid
+	// Enable mouse reporting only while the game is active, so its big-chat log
+	// can be scrolled with the trackpad/wheel. (This is what makes terminal
+	// text-selection need Option held — scoping it to the game limits that to
+	// where the scroll is wanted.)
+	if _, ok := m.active.(gameScreen); ok {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	v.WindowTitle = "wish · " + m.active.title()
 	return v
 }

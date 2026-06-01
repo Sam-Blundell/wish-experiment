@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/ssh"
@@ -1148,6 +1149,7 @@ type gameScreen struct {
 	snapshot    gameSnapshot
 	notes       []note         // this world's notes, refreshed when a snapshot arrives
 	chat        []gameChatLine // this world's chat backlog, refreshed when a snapshot arrives
+	chatVP      viewport.Model // big-chat scroll view; size/content synced in syncChatVP, scroll persists here
 	mode        inputMode      // current keyboard mode (move / speak / rename / read / note)
 	input       textarea.Model // wrapping compose input for speak, rename and note modes
 	readingText string         // text shown in the modal (sign or note)
@@ -1188,6 +1190,12 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 	styles.Cursor.Color = colorAmber
 	ta.SetStyles(styles)
 
+	// Scrollable viewport for the big-chat log. New() enables mouse-wheel; the
+	// panel background keeps its gaps grey to match the modal.
+	vp := viewport.New()
+	vp.Style = lipgloss.NewStyle().Background(colorPanelBg)
+	vp.MouseWheelDelta = 3
+
 	return gameScreen{
 		width:    width,
 		height:   height,
@@ -1196,6 +1204,7 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 		notes:    theGame.allNotes(),
 		chat:     theGame.chatFor(worldOutdoor),
 		input:    ta,
+		chatVP:   vp,
 	}
 }
 
@@ -1215,6 +1224,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.input.SetWidth(composeInputWidth(m.width)) // keep the chat bar's wrap-width in sync
 		case inputModeBigChat:
 			m.input.SetWidth(bigChatContentWidth(m.width))
+			m.syncChatVPStick()
 		}
 	case gameSnapshotMsg:
 		// Adopt the new state and re-arm the receiver so the *next* snapshot
@@ -1225,7 +1235,17 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		m.snapshot = gameSnapshot(msg)
 		m.notes = theGame.allNotes()
 		m.chat = theGame.chatFor(msg[m.player].worldID)
+		if m.mode == inputModeBigChat {
+			m.syncChatVPStick()
+		}
 		return m, gameWaitForSnap(m.player.send)
+	case tea.MouseWheelMsg:
+		// Trackpad / mouse-wheel scrolls the big-chat log.
+		if m.mode == inputModeBigChat {
+			m.syncChatVP()
+			m.chatVP, _ = m.chatVP.Update(msg)
+		}
+		return m, nil
 	case tea.KeyPressMsg:
 		// The controls modal swallows the next key, then closes.
 		if m.mode == inputModeHelp {
@@ -1251,6 +1271,16 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		// almost every key goes into the input rather than the movement
 		// system. Esc cancels, enter commits the appropriate action.
 		if m.mode != inputModeMove {
+			// In the big chat, PgUp/PgDn page the log viewport (intercepted
+			// before the input, which gets the rest of the keys).
+			if m.mode == inputModeBigChat {
+				switch msg.String() {
+				case "pgup", "pgdown":
+					m.syncChatVP()
+					m.chatVP, _ = m.chatVP.Update(msg)
+					return m, nil
+				}
+			}
 			switch msg.String() {
 			case "esc":
 				m.mode = inputModeMove
@@ -1302,6 +1332,8 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				}
 				if mode == inputModeBigChat && m.mode == inputModeMove {
 					m.mode = inputModeBigChat
+					m.syncChatVP() // the chat grew with our message
+					m.chatVP.GotoBottom()
 					return m, m.input.Focus()
 				}
 				return m, nil
@@ -1333,12 +1365,14 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.input.CursorEnd()
 			return m, m.input.Focus()
 		case "c":
-			// Open the full-screen chat view.
+			// Open the big chat (modal over the map), at the bottom of the log.
 			m.mode = inputModeBigChat
 			m.input.SetPromptFunc(2, firstLinePrompt("> "))
 			m.setInputInPanel(true)
 			m.input.CharLimit = sayCharCap
 			m.input.SetWidth(bigChatContentWidth(m.width))
+			m.syncChatVP()
+			m.chatVP.GotoBottom()
 			return m, m.input.Focus()
 		case "i":
 			// Read what we're on or near. Read position from the snapshot (not
@@ -1865,7 +1899,8 @@ func (m gameScreen) View() string {
 		layers = append(layers, composeModalLayer("New note", m.input.View(), "enter to drop · esc to cancel", m.width, m.height))
 	}
 	if bigChat {
-		layers = append(layers, bigChatModalLayer(m.chat, cellName, m.input.View(), m.width, m.height))
+		m.syncChatVP() // size the viewport to the current panel and load the log
+		layers = append(layers, bigChatModalLayer(m.chatVP.View(), cellName, m.input.View(), m.width, m.height))
 	}
 	return lipgloss.NewCompositor(layers...).Render()
 }
@@ -1875,25 +1910,14 @@ func (m gameScreen) View() string {
 // filling it, and the input at the bottom. esc closes it. Sized to leave a
 // margin of map around the edges, and its height never exceeds the terminal, so
 // the composite stays exactly `height` rows.
-func bigChatModalLayer(chat []gameChatLine, cellName, inputView string, width, height int) *lipgloss.Layer {
+func bigChatModalLayer(logView, cellName, inputView string, width, height int) *lipgloss.Layer {
 	panelBg := colorPanelBg
 	contentW := bigChatContentWidth(width)
-	// Outer panel is height-4 tall (a 2-row map margin top and bottom). Inside,
-	// minus the two border rows, leaves height-6 rows for header + log + input.
-	innerH := height - 6
-	if innerH < 3 {
-		innerH = 3
-	}
-	inputH := lipgloss.Height(inputView)
-	logH := innerH - 1 - inputH // 1 row for the header
-	if logH < 1 {
-		logH = 1
-	}
 
 	pad := lipgloss.NewStyle().Width(contentW).Background(panelBg)
 	header := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(panelBg).Width(contentW).
-		Render("chat · " + cellName + " · esc to close")
-	body := header + "\n" + pad.Render(renderChatFull(chat, contentW, logH)) + "\n" + pad.Render(inputView)
+		Render("chat · " + cellName + " · scroll: wheel / pgup-dn · esc to close")
+	body := header + "\n" + logView + "\n" + pad.Render(inputView)
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
@@ -1923,11 +1947,26 @@ func bigChatContentWidth(termWidth int) int {
 	return w
 }
 
-// renderChatFull renders the chat log wrapped to width, filling exactly `lines`
-// rows (newest at the bottom, blank-padded at the top). Unlike the docked
-// renderChatLog it wraps long messages instead of truncating — the expanded
-// view has the vertical room for it.
-func renderChatFull(chat []gameChatLine, width, lines int) string {
+// bigChatLogHeight is the number of log rows in the big-chat panel for a given
+// terminal height and input height (the panel leaves a 2-row map margin, a
+// border, and one header row). Shared by the renderer and the scroll clamp so
+// they can't disagree.
+func bigChatLogHeight(height, inputH int) int {
+	innerH := height - 6
+	if innerH < 3 {
+		innerH = 3
+	}
+	logH := innerH - 1 - inputH // 1 row for the header
+	if logH < 1 {
+		logH = 1
+	}
+	return logH
+}
+
+// wrapChatLines renders every chat message wrapped to width, returning all the
+// visual lines (newest last), each carrying the panel background. It wraps long
+// messages rather than truncating like the docked renderChatLog.
+func wrapChatLines(chat []gameChatLine, width int) []string {
 	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(colorPanelBg)
 	textStyle := lipgloss.NewStyle().Foreground(colorCream).Background(colorPanelBg)
 	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true).Background(colorPanelBg)
@@ -1941,13 +1980,35 @@ func renderChatFull(chat []gameChatLine, width, lines int) string {
 		}
 		rows = append(rows, strings.Split(wrap.Render(rendered), "\n")...)
 	}
-	if len(rows) > lines {
-		rows = rows[len(rows)-lines:]
+	return rows
+}
+
+// syncChatVP sizes the big-chat viewport to the current panel and loads it with
+// the world's chat, bottom-aligned (few messages sit just above the input). The
+// scroll position is preserved (viewport setters don't reset the offset); the
+// caller calls GotoBottom when it wants to stick to the newest line.
+func (m *gameScreen) syncChatVP() {
+	contentW := bigChatContentWidth(m.width)
+	logH := bigChatLogHeight(m.height, m.input.Height())
+	m.chatVP.SetWidth(contentW)
+	m.chatVP.SetHeight(logH)
+	lines := wrapChatLines(m.chat, contentW)
+	if pad := logH - len(lines); pad > 0 {
+		lines = append(make([]string, pad), lines...) // top-pad so the log sits at the bottom
 	}
-	for len(rows) < lines {
-		rows = append([]string{""}, rows...)
+	m.chatVP.SetContentLines(lines)
+}
+
+// syncChatVPStick re-syncs the viewport but keeps it pinned to the bottom if it
+// already was — so new messages auto-scroll into view, while a reader who has
+// scrolled up stays put.
+func (m *gameScreen) syncChatVPStick() {
+	m.chatVP.SetHeight(bigChatLogHeight(m.height, m.input.Height())) // current height for an accurate AtBottom
+	wasBottom := m.chatVP.AtBottom()
+	m.syncChatVP()
+	if wasBottom {
+		m.chatVP.GotoBottom()
 	}
-	return strings.Join(rows, "\n")
 }
 
 // renderChatLog formats the last `lines` chat messages into exactly `lines`
