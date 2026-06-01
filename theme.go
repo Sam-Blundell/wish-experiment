@@ -21,4 +21,10 @@ var (
 	colorAmber    = lipgloss.Color("214") // #ffaf00 — primary highlight
 	colorCream    = lipgloss.Color("222") // #ffd787 — body text
 	colorAmberDim = lipgloss.Color("130") // #af5f00 — separators, hints
+
+	// colorVoid is the declared terminal background. Set on the root view so the
+	// terminal knows its background colour; without it, regions the frame
+	// doesn't paint (or that the terminal erases) bleed whatever cell background
+	// was last active — see root.go's View.
+	colorVoid = lipgloss.Color("#000000")
 )

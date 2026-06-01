@@ -138,10 +138,17 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // (chat draws its own block cursor inside the input). Individual screens
 // can override this by including a `tea.Cursor` in their own state and
 // surfacing it — but at present nobody does.
+//
+// `BackgroundColor` declares the terminal's background so the terminal knows
+// what to fill erased / unpainted regions with. Without it, the game's coloured
+// cell backgrounds bleed (via Background Color Erase) into edge rows the frame
+// doesn't fully paint. Setting it to black matches the chrome and the CRT
+// aesthetic, and applies to every screen.
 func (m rootModel) View() tea.View {
 	v := tea.NewView(m.active.View())
 	v.AltScreen = true
 	v.Cursor = nil
+	v.BackgroundColor = colorVoid
 	v.WindowTitle = "wish · " + m.active.title()
 	return v
 }

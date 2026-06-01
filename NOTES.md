@@ -2,7 +2,7 @@
 
 ## Wish / Charmbracelet
 
-- `lipgloss.NewStyle()` uses a global renderer that detects the server's terminal, not the SSH client's. Colours won't work over remote SSH unless you use `bubbletea.MakeRenderer(session)` to create a per-session renderer and call `renderer.NewStyle()` instead.
+- Colours work over SSH automatically in the Charm **v2** stack — no per-session renderer needed. Lipgloss v2 removed the `Renderer` type: `Render()` emits full-fidelity ANSI and Bubble Tea v2 downsamples to the client's colour profile at output (detected from the client's `TERM`), with Wish v2's `bubbletea.Middleware` wiring the session's I/O into the program. (v1 required a per-session renderer via `bubbletea.MakeRenderer`; that function is gone in v2, so ignore v1-era tutorials that reach for it.)
 - Wish auto-generates a host key at the path you give `wish.WithHostKeyPath()`. If you delete it and it regenerates, SSH clients that connected before will reject the new key (REMOTE HOST IDENTIFICATION HAS CHANGED). On the VPS the key persists across restarts since it lives on disk.
 - You can't overwrite the app binary via SCP while the systemd service is running it. The deploy workflow needs to stop the service first, copy the binary, then start it again.
 

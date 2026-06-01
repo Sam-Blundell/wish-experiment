@@ -2,14 +2,14 @@ package main
 
 import (
 	"fmt"
-	"image/color"
+	"log"
 	"math"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
-	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/ssh"
@@ -42,9 +42,12 @@ const (
 	worldWidth     = 120
 	worldHeight    = 60
 	gameMaxPlayers = 20
-	bubbleDuration = 4 * time.Second
-	bubbleCharCap  = 60
+	cueDuration    = 1500 * time.Millisecond // how long a speaker's nameplate flashes after they talk
+	sayCharCap     = 200
 	nickCharCap    = 16
+	noteCharCap    = 140
+	maxGameChat    = 200 // per-world chat backlog kept in memory
+	chatLogLines   = 3   // chat lines shown in the docked (unexpanded) pane
 )
 
 // inputMode enumerates the screen's keyboard modes. `iota` gives each
@@ -55,9 +58,11 @@ type inputMode int
 
 const (
 	inputModeMove   inputMode = iota // arrow keys drive the player
-	inputModeSpeak                   // typing into a speech bubble
+	inputModeSpeak                   // typing a chat message
 	inputModeRename                  // typing a new nickname
-	inputModeRead                    // reading a signpost modal
+	inputModeRead                    // reading a signpost or note modal
+	inputModeNote                    // typing a note to drop on the ground
+	inputModeHelp                    // the controls modal is open
 )
 
 // Game-only palette. The amber-monochrome theme from theme.go works for
@@ -149,6 +154,8 @@ var (
 	colorStone       = lipgloss.Color("#9a9aa6") // standing stone highlight
 	colorJettyBg     = lipgloss.Color("#7a5a38") // jetty planks — wood
 	colorJetty       = lipgloss.Color("#5a4028") // plank seams
+
+	colorNote = lipgloss.Color("#e8d8a0") // dropped-note marker — parchment
 )
 
 type tile rune
@@ -585,8 +592,32 @@ func nearbySign(me gamePlayerInfo) (sign, bool) {
 	return sign{}, false
 }
 
-// signModalLayer builds the centred panel shown while reading a sign.
-func signModalLayer(text string, width, height int) *lipgloss.Layer {
+// gameHelpText builds the controls list shown in the help modal (raised with
+// `?` or by typing `/help`). Built rather than a const so the key/description
+// columns stay aligned.
+func gameHelpText() string {
+	rows := [][2]string{
+		{"move", "arrows / wasd / hjkl"},
+		{"t", "say something"},
+		{"p", "leave a note"},
+		{"n", "rename yourself"},
+		{"i", "read a sign or note"},
+		{"x", "remove your note (reading)"},
+		{"? /help", "show this help"},
+		{"esc", "leave the game"},
+	}
+	var b strings.Builder
+	b.WriteString("Controls\n\n")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%-9s %s\n", r[0], r[1])
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// signModalLayer builds the centred panel shown while reading a sign or note.
+// removable adds an "x to remove" hint to the footer (used when the reader owns
+// the note they're looking at).
+func signModalLayer(text string, width, height int, removable bool) *lipgloss.Layer {
 	boxW := 40
 	if max := width - 8; boxW > max {
 		boxW = max
@@ -596,7 +627,11 @@ func signModalLayer(text string, width, height int) *lipgloss.Layer {
 	}
 	panelBg := lipgloss.Color("235")
 	body := lipgloss.NewStyle().Foreground(colorCream).Background(panelBg).Width(boxW).Render(text)
-	footer := lipgloss.NewStyle().Foreground(colorAmberDim).Background(panelBg).Render("esc to close")
+	footerText := "esc to close"
+	if removable {
+		footerText = "esc to close · x to remove"
+	}
+	footer := lipgloss.NewStyle().Foreground(colorAmberDim).Background(panelBg).Render(footerText)
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorAmber).
@@ -688,15 +723,15 @@ func carveLake(w *worldGrid, cx, cy, rx, ry int, margin tile) {
 // as identity throughout — two players with the same nick are still
 // distinct pointers, so they don't clash as map keys.
 //
-// `message` and `messageExpires` track the currently-floating speech bubble.
-// They live under the game's mutex with the rest of the player fields.
+// `messageExpires` is set when the player speaks; until it passes, the renderer
+// flashes a "just spoke" cue on their nameplate. The message text itself goes to
+// the world's chat log, not onto the player. Lives under the game's mutex.
 type gamePlayer struct {
 	send           chan gameSnapshot
 	ip             string
 	nick           string
 	worldID        int // which world the player is currently in
 	x, y           int
-	message        string
 	messageExpires time.Time
 }
 
@@ -714,8 +749,7 @@ type gamePlayerInfo struct {
 	name           string
 	worldID        int
 	x, y           int
-	message        string
-	messageExpires time.Time
+	messageExpires time.Time // non-zero & future ⇒ flash the "just spoke" cue
 }
 
 // gameSnapshot is the message broadcast to every player after each state
@@ -730,10 +764,42 @@ type gameSnapshot map[*gamePlayer]gamePlayerInfo
 type game struct {
 	mu      sync.Mutex
 	players map[*gamePlayer]struct{}
+	notes   []note                 // notes dropped on the ground; guarded by mu, persisted via store
+	store   NoteStore              // persistence backend for notes; wired up in notes.go's init
+	chat    map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
 }
 
 var theGame = &game{
 	players: make(map[*gamePlayer]struct{}),
+	chat:    make(map[int][]gameChatLine),
+}
+
+// gameChatLine is one line in a world's chat log. A blank `from` marks a system
+// line (arrivals, departures) rather than something a player said.
+type gameChatLine struct {
+	from string
+	text string
+}
+
+// appendChat adds a line to a world's chat backlog, trimming to maxGameChat.
+// Caller holds g.mu.
+func (g *game) appendChat(worldID int, line gameChatLine) {
+	msgs := append(g.chat[worldID], line)
+	if len(msgs) > maxGameChat {
+		msgs = msgs[len(msgs)-maxGameChat:]
+	}
+	g.chat[worldID] = msgs
+}
+
+// chatFor returns a private copy of a world's chat backlog, safe to read without
+// the lock. Pulled by each screen when a snapshot arrives, like allNotes.
+func (g *game) chatFor(worldID int) []gameChatLine {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	src := g.chat[worldID]
+	out := make([]gameChatLine, len(src))
+	copy(out, src)
+	return out
 }
 
 func (g *game) join(p *gamePlayer) bool {
@@ -746,6 +812,7 @@ func (g *game) join(p *gamePlayer) bool {
 		return false
 	}
 	g.players[p] = struct{}{}
+	g.appendChat(p.worldID, gameChatLine{text: p.displayName() + " arrived"})
 	g.broadcast()
 	return true
 }
@@ -796,6 +863,7 @@ func (g *game) leave(p *gamePlayer) {
 		return
 	}
 	delete(g.players, p)
+	g.appendChat(p.worldID, gameChatLine{text: p.displayName() + " left"})
 	g.broadcast()
 }
 
@@ -865,7 +933,6 @@ func (g *game) buildSnapshot() gameSnapshot {
 			worldID:        p.worldID,
 			x:              p.x,
 			y:              p.y,
-			message:        p.message,
 			messageExpires: p.messageExpires,
 		}
 	}
@@ -895,10 +962,9 @@ func (g *game) rename(p *gamePlayer, newNick string) {
 	g.broadcast()
 }
 
-// say sets the speaker's floating-bubble message, broadcasts the new state,
-// and schedules a background goroutine to clear the bubble after
-// bubbleDuration. The clearer only fires if no newer message has been
-// said in the meantime (checked via messageExpires equality).
+// say posts a chat line to the speaker's current world and flashes a "just
+// spoke" cue on their nameplate for cueDuration. The text lives in the world's
+// chat log (everyone in that cell sees it); the cue is just the visual ping.
 func (g *game) say(p *gamePlayer, msg string) {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
@@ -909,26 +975,106 @@ func (g *game) say(p *gamePlayer, msg string) {
 		g.mu.Unlock()
 		return
 	}
-	p.message = msg
-	p.messageExpires = time.Now().Add(bubbleDuration)
+	g.appendChat(p.worldID, gameChatLine{from: p.displayName(), text: msg})
+	p.messageExpires = time.Now().Add(cueDuration)
 	expires := p.messageExpires
 	g.broadcast()
 	g.mu.Unlock()
 
+	// Re-broadcast once the cue lapses so the flash clears even if the area is
+	// idle (nothing else would trigger a redraw). Skip if a newer say() has
+	// since pushed the expiry forward.
 	go func() {
-		time.Sleep(bubbleDuration + 10*time.Millisecond)
+		time.Sleep(cueDuration + 10*time.Millisecond)
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		if _, ok := g.players[p]; !ok {
 			return
 		}
-		// Only clear if the expiry we scheduled is still the active one.
-		// A newer say() would have replaced it with a later time.
 		if p.messageExpires.Equal(expires) {
-			p.message = ""
 			g.broadcast()
 		}
 	}()
+}
+
+// addNote drops a note on the ground at the player's current tile. Anyone in the
+// same world then sees a marker there and can stand on it to read it. Notes are
+// this codebase's first piece of mutable, shared *world* state (players were the
+// only thing that changed before) and the first thing we persist — see notes.go.
+func (g *game) addNote(p *gamePlayer, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return
+	}
+	// At most one note per tile: if this spot's already taken, leave the
+	// existing note be. Simplest rule, and it stops one player papering a tile.
+	for _, n := range g.notes {
+		if n.WorldID == p.worldID && n.X == p.x && n.Y == p.y {
+			return
+		}
+	}
+	g.notes = append(g.notes, note{
+		WorldID: p.worldID, X: p.x, Y: p.y,
+		Text: text, Author: p.displayName(), AuthorIP: p.ip, Created: time.Now(),
+	})
+	// Persist while we still hold the lock. Doing it here — rather than in a
+	// background goroutine — keeps saves ordered and means the file on disk
+	// always matches what we've broadcast. The write is a tiny file and notes
+	// are dropped rarely, so the I/O cost under the lock is negligible here;
+	// see HARD-EDGES.md for when that stops being true.
+	if g.store != nil {
+		if err := g.store.Save(g.notes); err != nil {
+			log.Printf("notes: could not save: %v", err)
+		}
+	}
+	g.broadcast()
+}
+
+// removeNote deletes the note on the player's current tile — but only if they
+// placed it (matched by IP; see note.AuthorIP). It's a no-op otherwise, so the
+// caller can fire it unconditionally and let ownership decide.
+func (g *game) removeNote(p *gamePlayer) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return
+	}
+	for i, n := range g.notes {
+		if n.WorldID == p.worldID && n.X == p.x && n.Y == p.y {
+			if n.AuthorIP != p.ip {
+				return // someone else's note — leave it be
+			}
+			// Delete index i by shifting the tail down one. Mutating the
+			// backing array in place is safe here because allNotes hands out
+			// copies — no reader is holding this slice.
+			g.notes = append(g.notes[:i], g.notes[i+1:]...)
+			if g.store != nil {
+				if err := g.store.Save(g.notes); err != nil {
+					log.Printf("notes: could not save: %v", err)
+				}
+			}
+			g.broadcast()
+			return
+		}
+	}
+}
+
+// allNotes returns a private copy of every note, safe to read without the lock.
+// Notes change rarely, so screens pull them this way when a snapshot arrives
+// rather than carrying them inside every per-move snapshot (which would re-copy
+// the note text on every single step). The copy lets the caller read freely
+// while the hub keeps mutating g.notes.
+func (g *game) allNotes() []note {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]note, len(g.notes))
+	copy(out, g.notes)
+	return out
 }
 
 // broadcast snapshots state and pushes it to every player's send channel.
@@ -962,9 +1108,11 @@ type gameScreen struct {
 	height      int
 	player      *gamePlayer
 	snapshot    gameSnapshot
-	mode        inputMode       // current keyboard mode (move / speak / rename / read)
-	input       textinput.Model // shared input widget for speak and rename modes
-	readingText string          // text of the sign being read (when mode == read)
+	notes       []note         // this world's notes, refreshed when a snapshot arrives
+	chat        []gameChatLine // this world's chat backlog, refreshed when a snapshot arrives
+	mode        inputMode      // current keyboard mode (move / speak / rename / read / note)
+	input       textarea.Model // wrapping compose input for speak, rename and note modes
+	readingText string         // text shown in the modal (sign or note)
 }
 
 func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
@@ -986,22 +1134,30 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 		theGame.leave(p)
 	}()
 
-	// Shared input widget used for speech bubbles and renames. Width and
-	// CharLimit are reconfigured per-mode when the player enters one. Not
-	// focused until the player presses 't' (speak) or 'n' (rename).
-	ti := textinput.New()
-	ti.Prompt = ""
-	styles := ti.Styles()
+	// Shared compose widget for the typing modes. It soft-wraps and grows from
+	// 1 to 3 rows as the message gets longer; Enter sends (intercepted in
+	// Update, so the textarea never inserts a newline — messages stay a single
+	// logical line). Prompt, width and char limit are set per-mode on entry.
+	ta := textarea.New()
+	ta.ShowLineNumbers = false
+	ta.DynamicHeight = true
+	ta.MinHeight = 1
+	ta.MaxHeight = 3
+	styles := ta.Styles()
+	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
 	styles.Focused.Text = lipgloss.NewStyle().Foreground(colorCream)
+	styles.Focused.CursorLine = lipgloss.NewStyle() // no cursor-line highlight
 	styles.Cursor.Color = colorAmber
-	ti.SetStyles(styles)
+	ta.SetStyles(styles)
 
 	return gameScreen{
 		width:    width,
 		height:   height,
 		player:   p,
 		snapshot: theGame.snapshot(),
-		input:    ti,
+		notes:    theGame.allNotes(),
+		chat:     theGame.chatFor(worldOutdoor),
+		input:    ta,
 	}
 }
 
@@ -1016,16 +1172,33 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.input.SetWidth(composeInputWidth(m.width)) // keep compose wrap-width in sync
 	case gameSnapshotMsg:
-		// Adopt the new state and re-arm the receiver so the *next*
-		// snapshot also reaches us.
+		// Adopt the new state and re-arm the receiver so the *next* snapshot
+		// also reaches us. Notes aren't in the snapshot (they change rarely and
+		// we don't want to copy note text on every move), so we re-pull them
+		// from the hub whenever anything changes — a placement always triggers
+		// a broadcast, so this refresh sees it.
 		m.snapshot = gameSnapshot(msg)
+		m.notes = theGame.allNotes()
+		m.chat = theGame.chatFor(msg[m.player].worldID)
 		return m, gameWaitForSnap(m.player.send)
 	case tea.KeyPressMsg:
-		// Reading a signpost: the modal swallows input until dismissed.
+		// The controls modal swallows the next key, then closes.
+		if m.mode == inputModeHelp {
+			m.mode = inputModeMove
+			return m, nil
+		}
+		// Reading a signpost or note: the modal swallows input until dismissed.
+		// `x` removes the note (a no-op unless it's yours, so pressing it while
+		// reading a sign just closes the modal).
 		if m.mode == inputModeRead {
 			switch msg.String() {
 			case "esc", "i", "enter", "q", " ":
+				m.mode = inputModeMove
+				m.readingText = ""
+			case "x":
+				theGame.removeNote(m.player)
 				m.mode = inputModeMove
 				m.readingText = ""
 			}
@@ -1049,9 +1222,15 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				m.input.Blur()
 				switch mode {
 				case inputModeSpeak:
-					theGame.say(m.player, text)
+					if strings.TrimSpace(text) == "/help" {
+						m.mode = inputModeHelp
+					} else {
+						theGame.say(m.player, text)
+					}
 				case inputModeRename:
 					theGame.rename(m.player, text)
+				case inputModeNote:
+					theGame.addNote(m.player, text)
 				}
 				return m, nil
 			}
@@ -1066,27 +1245,43 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			return m, func() tea.Msg { return ShowDirectoryMsg{} }
 		case "t":
 			m.mode = inputModeSpeak
-			m.input.CharLimit = bubbleCharCap
-			m.input.SetWidth(bubbleCharCap)
+			m.input.Prompt = "say> "
+			m.input.CharLimit = sayCharCap
+			m.input.SetWidth(composeInputWidth(m.width))
 			return m, m.input.Focus()
 		case "n":
 			m.mode = inputModeRename
+			m.input.Prompt = "name> "
 			m.input.CharLimit = nickCharCap
-			m.input.SetWidth(nickCharCap)
+			m.input.SetWidth(composeInputWidth(m.width))
 			// Pre-fill with the current nick (if any) so the user can edit
 			// rather than retype. getNick reads under its own mutex, safe
 			// to call here.
 			m.input.SetValue(getNick(m.player.ip))
 			m.input.CursorEnd()
 			return m, m.input.Focus()
+		case "p":
+			// Compose a note to drop on the ground at our feet.
+			m.mode = inputModeNote
+			m.input.Prompt = "note> "
+			m.input.CharLimit = noteCharCap
+			m.input.SetWidth(composeInputWidth(m.width))
+			return m, m.input.Focus()
 		case "i":
-			// Read a signpost if we're standing within a tile of one. Read
-			// position from the snapshot (not m.player) to avoid racing the
-			// hub, exactly as View does.
-			if sg, ok := nearbySign(m.snapshot[m.player]); ok {
+			// Read what we're on or near. Read position from the snapshot (not
+			// m.player) to avoid racing the hub, exactly as View does. A note
+			// underfoot takes priority over a nearby signpost.
+			me := m.snapshot[m.player]
+			if n, ok := noteUnder(m.notes, me); ok {
+				m.mode = inputModeRead
+				m.readingText = n.Text + "\n\n— " + n.Author
+			} else if sg, ok := nearbySign(me); ok {
 				m.mode = inputModeRead
 				m.readingText = sg.text
 			}
+			return m, nil
+		case "?":
+			m.mode = inputModeHelp
 			return m, nil
 		case "up", "k", "w":
 			theGame.move(m.player, 0, -1)
@@ -1099,7 +1294,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		}
 	}
 	// Forward any unhandled message (e.g. cursor blink ticks while a
-	// non-move mode is active) to the textinput so its internal state
+	// non-move mode is active) to the textarea so its internal state
 	// keeps ticking.
 	if m.mode != inputModeMove {
 		var cmd tea.Cmd
@@ -1130,8 +1325,16 @@ func (m gameScreen) View() string {
 	me := m.snapshot[m.player]
 	curWorld := worlds[me.worldID]
 
-	const statusH, helpH = 1, 1
-	viewportH := m.height - statusH - helpH
+	// The strip between map and chat is one divider row normally, but while
+	// composing it's the input, which soft-wraps and grows up to 3 rows. The map
+	// gives up those rows; the chat pane stays fixed. (The min-size gate above
+	// already bailed on tiny terminals, so this fits.)
+	composing := m.mode == inputModeSpeak || m.mode == inputModeRename || m.mode == inputModeNote
+	midH := 1
+	if composing {
+		midH = m.input.Height()
+	}
+	viewportH := m.height - chatLogLines - midH
 	viewportTilesW := m.width / 2
 	viewportTilesH := viewportH
 
@@ -1277,6 +1480,16 @@ func (m gameScreen) View() string {
 		others[[2]int{info.x, info.y}] = info
 	}
 
+	// Index this world's notes by coordinate too, so the tile loop can test for
+	// a note marker with an O(1) lookup. m.notes is the copy pulled from the hub
+	// when the last snapshot arrived.
+	notesByPos := make(map[[2]int]note)
+	for _, n := range m.notes {
+		if n.WorldID == me.worldID {
+			notesByPos[[2]int{n.X, n.Y}] = n
+		}
+	}
+
 	// Build the viewport on a Lip Gloss Canvas: a 2D buffer of styled
 	// cells. We set each tile's two cells directly rather than building
 	// a string with embedded ANSI per glyph — Bubble Tea's renderer can
@@ -1395,6 +1608,13 @@ func (m gameScreen) View() string {
 			case othersContains(others, wx, wy):
 				left = &uv.Cell{Content: "@", Width: 1, Style: uv.Style{Fg: colorPlayerOther, Bg: fill.Bg, Attrs: uv.AttrBold}}
 				right = &uv.Cell{Content: " ", Width: 1, Style: uv.Style{Bg: fill.Bg}}
+			case notePosContains(notesByPos, wx, wy):
+				// A dropped note: a parchment marker sitting on top of the
+				// terrain (it keeps the tile's background, the way players do).
+				// The player cases above win, so standing on a note hides the
+				// marker — the help line tells you it's there to read.
+				left = &uv.Cell{Content: "▤", Width: 1, Style: uv.Style{Fg: colorNote, Bg: fill.Bg, Attrs: uv.AttrBold}}
+				right = &uv.Cell{Content: " ", Width: 1, Style: uv.Style{Bg: fill.Bg}}
 			default:
 				left = &uv.Cell{Content: leftRune, Width: 1, Style: fill}
 				right = &uv.Cell{Content: rightRune, Width: 1, Style: fill}
@@ -1471,83 +1691,38 @@ func (m gameScreen) View() string {
 			visibleCount++
 		}
 	}
-	statusLine := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render("gametest") +
-		lipgloss.NewStyle().Foreground(colorAmberDim).Render(
-			fmt.Sprintf("  [%s] %d here · pos (%d, %d)", cellName, visibleCount, me.x, me.y),
-		)
-	var helpText string
-	switch m.mode {
-	case inputModeSpeak:
-		helpText = "enter to send · esc to cancel"
-	case inputModeRename:
-		helpText = "type a name · enter to set · esc to cancel"
-	case inputModeRead:
-		helpText = "esc to close"
-	default:
-		helpText = "arrows / wasd / hjkl to move · t to say · n to rename · esc to leave"
-		if _, ok := nearbySign(me); ok {
-			helpText = "i to read sign · " + helpText
+	// The strip between map and chat: the wrapping input while composing,
+	// otherwise a double rule labelled with the current cell and headcount (the
+	// only persistent status now the top line is gone) plus a read hint when
+	// standing on a sign or note.
+	var midBlock string
+	if composing {
+		midBlock = m.input.View()
+	} else {
+		label := fmt.Sprintf("══ %s · %d here ", cellName, visibleCount)
+		if _, ok := noteUnder(m.notes, me); ok {
+			label += "· i read note "
+		} else if _, ok := nearbySign(me); ok {
+			label += "· i read sign "
 		}
-	}
-	help := lipgloss.NewStyle().Foreground(colorAmberDim).Render(helpText)
-
-	base := strings.Join([]string{statusLine, canvas.Render(), help}, "\n")
-
-	// Collect every bubble we need to overlay: live messages from any
-	// player whose expiry is still in the future, plus the local player's
-	// in-progress textinput if they're composing or renaming.
-	//
-	// `border` controls the bubble's border colour — amber for speech,
-	// lavender for renames — which gives the user a visual cue about
-	// which mode they're in (it also matches the nameplate colour for
-	// the rename case, since renaming literally edits a nameplate).
-	type bubbleSpec struct {
-		x, y   int
-		text   string
-		border color.Color
-	}
-	var bubbles []bubbleSpec
-	now := time.Now()
-	for p, info := range m.snapshot {
-		// Skip players in other worlds — speech doesn't carry between cells.
-		if info.worldID != me.worldID {
-			continue
+		fill := m.width - lipgloss.Width(label)
+		if fill < 0 {
+			fill = 0
 		}
-		// Skip our own message if we're typing — the live input bubble
-		// below replaces it. Also skip empty/expired messages.
-		if p == m.player && m.mode != inputModeMove {
-			continue
-		}
-		if info.message == "" || !info.messageExpires.After(now) {
-			continue
-		}
-		bubbles = append(bubbles, bubbleSpec{
-			x: info.x, y: info.y, text: info.message, border: colorAmber,
-		})
-	}
-	if m.mode != inputModeMove {
-		border := colorAmber
-		if m.mode == inputModeRename {
-			border = colorNameplate
-		}
-		bubbles = append(bubbles, bubbleSpec{
-			x: me.x, y: me.y, text: m.input.View(), border: border,
-		})
+		midBlock = lipgloss.NewStyle().Foreground(colorAmberDim).Render(label + strings.Repeat("═", fill))
 	}
 
-	// Build a Compositor: the rendered base text becomes the bottom layer.
-	// On top we add a persistent nameplate per player, then any active
-	// speech bubbles (which will sit visually on top of nameplates when
-	// both occupy the same cells — compositor z-order is insertion order).
-	//
-	// Layout per bubble: 1 top border + 1 content line + 1 bottom border +
-	// 1 tail row = 4 rows total. Text never wraps because we don't set a
-	// Width on the bubble's style, so this stays constant.
+	// Docked chat pane: the last few messages for this world, newest at the
+	// bottom, blank-padded to a fixed height.
+	chatBlock := renderChatLog(m.chat, m.width, chatLogLines)
+
+	base := strings.Join([]string{canvas.Render(), midBlock, chatBlock}, "\n")
+
+	// Compositor: the base text on the bottom, player nameplates layered over
+	// it. Speech is in the chat pane now (no floating bubbles), so nameplates
+	// and the read modal are the only overlays left.
 	layers := []*lipgloss.Layer{lipgloss.NewLayer(base)}
-	const (
-		canvasOffsetY = 1 // base rows: [0] status, [1..] canvas
-		bubbleH       = 4
-	)
+	const canvasOffsetY = 0 // base rows: [0..] canvas (the map is the top of the frame now)
 
 	// onScreen reports whether a world tile is inside the current viewport.
 	onScreen := func(x, y int) bool {
@@ -1555,13 +1730,20 @@ func (m gameScreen) View() string {
 			y >= camY && y < camY+viewportTilesH
 	}
 
-	// Nameplates: one row above each on-screen player's @, centred on it.
-	// Uses a soft lavender so they read as UI rather than part of the world.
-	// Only show plates for players in the same world as us.
+	// Nameplates: one row above each on-screen player's @, centred on it. Soft
+	// lavender normally; while a player's "just spoke" cue is live (messageExpires
+	// still in the future) the plate flashes amber with a leading "!" so you can
+	// see who's talking and glance at the chat pane for what they said.
+	now := time.Now()
 	nameStyle := lipgloss.NewStyle().Foreground(colorNameplate)
+	cueStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
 	for _, info := range m.snapshot {
 		if info.worldID != me.worldID || info.name == "" || !onScreen(info.x, info.y) {
 			continue
+		}
+		plateText, style := info.name, nameStyle
+		if info.messageExpires.After(now) {
+			plateText, style = "! "+info.name, cueStyle
 		}
 		playerCol := (info.x - camX + worldOffsetTilesX) * 2
 		playerRow := canvasOffsetY + (info.y - camY + worldOffsetTilesY)
@@ -1570,7 +1752,7 @@ func (m gameScreen) View() string {
 		if nameRow < canvasOffsetY {
 			nameRow = playerRow + 1
 		}
-		plate := nameStyle.Render(info.name)
+		plate := style.Render(plateText)
 		plateW := lipgloss.Width(plate)
 		plateX := playerCol - (plateW-1)/2
 		if plateX < 0 {
@@ -1582,64 +1764,83 @@ func (m gameScreen) View() string {
 		layers = append(layers, lipgloss.NewLayer(plate).X(plateX).Y(nameRow))
 	}
 
-	for _, b := range bubbles {
-		if !onScreen(b.x, b.y) {
-			continue
-		}
-		// Player's left cell on the canvas, then in compositor coords.
-		// Apply the same centring offset used for the tile rendering.
-		playerCol := (b.x - camX + worldOffsetTilesX) * 2
-		playerRow := canvasOffsetY + (b.y - camY + worldOffsetTilesY)
-		// If the bubble fits above the player without spilling off the
-		// top of the screen, point down at them. Otherwise flip below.
-		roomAbove := playerRow >= bubbleH
-		bubble, tailCol := renderBubble(b.text, roomAbove, b.border)
-		var bubbleY int
-		if roomAbove {
-			bubbleY = playerRow - bubbleH
-		} else {
-			bubbleY = playerRow + 1
-		}
-		// Anchor the bubble so the tail sits in the same column as the
-		// player's "@" glyph.
-		bubbleX := playerCol - tailCol
-		// Clip horizontally so we never produce out-of-bounds coordinates.
-		if bubbleX < 0 {
-			bubbleX = 0
-		}
-		if bw := lipgloss.Width(bubble); bubbleX+bw > m.width {
-			bubbleX = m.width - bw
-			if bubbleX < 0 {
-				bubbleX = 0
-			}
-		}
-		layers = append(layers, lipgloss.NewLayer(bubble).X(bubbleX).Y(bubbleY))
-	}
 	if m.mode == inputModeRead {
-		layers = append(layers, signModalLayer(m.readingText, m.width, m.height))
+		// Offer removal in the footer only when we're reading our own note
+		// (matched by IP). The IP is immutable so it's safe to read directly,
+		// unlike position which we take from the snapshot.
+		removable := false
+		if n, ok := noteUnder(m.notes, me); ok && n.AuthorIP == m.player.ip {
+			removable = true
+		}
+		layers = append(layers, signModalLayer(m.readingText, m.width, m.height, removable))
+	}
+	if m.mode == inputModeHelp {
+		layers = append(layers, signModalLayer(gameHelpText(), m.width, m.height, false))
 	}
 	return lipgloss.NewCompositor(layers...).Render()
 }
 
-// renderBubble draws a single speech-style bubble around `text`. tailDown
-// flips between bubble-above-speaker (tail points down) and below (tail
-// points up). border selects the border + tail colour (amber for speech,
-// lavender for renames). The second return is the column index of the
-// tail glyph, used by the caller to align it over the speaker.
-func renderBubble(text string, tailDown bool, border color.Color) (string, int) {
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(border).
-		Padding(0, 1).
-		Foreground(colorCream).
-		Render(text)
-	boxW := lipgloss.Width(box)
-	tailCol := boxW / 2
-	tail := lipgloss.NewStyle().Foreground(border)
-	if tailDown {
-		return box + "\n" + strings.Repeat(" ", tailCol) + tail.Render("v"), tailCol
+// renderChatLog formats the last `lines` chat messages into exactly `lines`
+// rows — newest at the bottom, blank-padded at the top so the pane is a fixed
+// height — each clipped to `width` columns.
+func renderChatLog(chat []gameChatLine, width, lines int) string {
+	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	textStyle := lipgloss.NewStyle().Foreground(colorCream)
+	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true)
+
+	start := len(chat) - lines
+	if start < 0 {
+		start = 0
 	}
-	return strings.Repeat(" ", tailCol) + tail.Render("^") + "\n" + box, tailCol
+	recent := chat[start:]
+
+	rows := make([]string, 0, lines)
+	for i := 0; i < lines-len(recent); i++ {
+		rows = append(rows, "") // top-pad so the log sits at the bottom of its region
+	}
+	for _, line := range recent {
+		if line.from == "" {
+			rows = append(rows, systemStyle.Render(truncateText("* "+line.text, width)))
+			continue
+		}
+		prefix := line.from + ": "
+		budget := width - lipgloss.Width(prefix)
+		if budget < 1 {
+			budget = 1
+		}
+		rows = append(rows, senderStyle.Render(prefix)+textStyle.Render(truncateText(line.text, budget)))
+	}
+	return strings.Join(rows, "\n")
+}
+
+// truncateText clips s to at most `max` display columns, adding an ellipsis when
+// it overflows. Width is approximated by rune count for the cut, which is exact
+// for the latin text chat is overwhelmingly made of.
+func truncateText(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	r := []rune(s)
+	if len(r) > max-1 {
+		r = r[:max-1]
+	}
+	return string(r) + "…"
+}
+
+// composeInputWidth sizes the bottom-line text input to roughly fill the
+// terminal width (leaving room for the prompt), with a floor for narrow ones.
+func composeInputWidth(termWidth int) int {
+	w := termWidth - 8
+	if w < 20 {
+		w = 20
+	}
+	return w
 }
 
 // othersContains keeps the type-switch in View readable — Go doesn't have
@@ -1647,6 +1848,25 @@ func renderBubble(text string, tailDown bool, border color.Color) (string, int) 
 func othersContains(m map[[2]int]gamePlayerInfo, x, y int) bool {
 	_, ok := m[[2]int{x, y}]
 	return ok
+}
+
+// notePosContains is the same one-liner for the note-marker lookup in View.
+func notePosContains(m map[[2]int]note, x, y int) bool {
+	_, ok := m[[2]int{x, y}]
+	return ok
+}
+
+// noteUnder returns the note on the exact tile the player is standing on, if
+// any — you read a note by standing on its marker and pressing i. It takes a
+// position snapshot (gamePlayerInfo) rather than the live player, so it doesn't
+// race the hub, exactly like nearbySign.
+func noteUnder(notes []note, me gamePlayerInfo) (note, bool) {
+	for _, n := range notes {
+		if n.WorldID == me.worldID && n.X == me.x && n.Y == me.y {
+			return n, true
+		}
+	}
+	return note{}, false
 }
 
 // grassHash maps a world coordinate to a stable pseudo-random value, used by
