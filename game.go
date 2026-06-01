@@ -48,6 +48,7 @@ const (
 	noteCharCap    = 140
 	maxGameChat    = 200 // per-world chat backlog kept in memory
 	chatLogLines   = 3   // chat lines shown in the docked (unexpanded) pane
+	composeModalW  = 40  // input width inside the rename / note modal
 )
 
 // inputMode enumerates the screen's keyboard modes. `iota` gives each
@@ -57,12 +58,13 @@ const (
 type inputMode int
 
 const (
-	inputModeMove   inputMode = iota // arrow keys drive the player
-	inputModeSpeak                   // typing a chat message
-	inputModeRename                  // typing a new nickname
-	inputModeRead                    // reading a signpost or note modal
-	inputModeNote                    // typing a note to drop on the ground
-	inputModeHelp                    // the controls modal is open
+	inputModeMove    inputMode = iota // arrow keys drive the player
+	inputModeSpeak                    // typing a chat message
+	inputModeRename                   // typing a new nickname
+	inputModeRead                     // reading a signpost or note modal
+	inputModeNote                     // typing a note to drop on the ground
+	inputModeHelp                     // the controls modal is open
+	inputModeBigChat                  // the full-screen chat view is open
 )
 
 // Game-only palette. The amber-monochrome theme from theme.go works for
@@ -77,6 +79,7 @@ var (
 	colorPlayerSelf  = lipgloss.Color("15")  // your @ — white
 	colorPlayerOther = lipgloss.Color("245") // other players' @ — grey
 	colorNameplate   = lipgloss.Color("141") // nameplates — soft lavender (UI, not world)
+	colorPanelBg     = lipgloss.Color("235") // modal / panel background — dark grey
 
 	// Background fills. mk2 paints a background colour on every tile so the
 	// world reads as solid blocks instead of glyphs floating on the
@@ -596,22 +599,56 @@ func nearbySign(me gamePlayerInfo) (sign, bool) {
 // `?` or by typing `/help`). Built rather than a const so the key/description
 // columns stay aligned.
 func gameHelpText() string {
-	rows := [][2]string{
+	keys := [][2]string{
 		{"move", "arrows / wasd / hjkl"},
-		{"t", "say something"},
-		{"p", "leave a note"},
-		{"n", "rename yourself"},
+		{"t", "say a line"},
+		{"c", "open full chat"},
+		{"/", "start a command"},
 		{"i", "read a sign or note"},
 		{"x", "remove your note (reading)"},
-		{"? /help", "show this help"},
+		{"?", "show this help"},
 		{"esc", "leave the game"},
+	}
+	cmds := [][2]string{
+		{"/nick", "set your nickname"},
+		{"/note", "leave a note"},
+		{"/help", "show this help"},
 	}
 	var b strings.Builder
 	b.WriteString("Controls\n\n")
-	for _, r := range rows {
+	for _, r := range keys {
+		fmt.Fprintf(&b, "%-9s %s\n", r[0], r[1])
+	}
+	b.WriteString("\nIn chat:\n")
+	for _, r := range cmds {
 		fmt.Fprintf(&b, "%-9s %s\n", r[0], r[1])
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// composeModalLayer builds the centred panel for editing a name or note. The
+// input is passed already-rendered (the shared textarea); we just frame it with
+// a title and a hint. Same panel look as signModalLayer.
+func composeModalLayer(title, inputView, hint string, width, height int) *lipgloss.Layer {
+	panelBg := colorPanelBg
+	t := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(panelBg).Render(title)
+	h := lipgloss.NewStyle().Foreground(colorAmberDim).Background(panelBg).Render(hint)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorAmber).
+		BorderBackground(panelBg).
+		Background(panelBg).
+		Padding(1, 2).
+		Render(t + "\n\n" + inputView + "\n\n" + h)
+	x := (width - lipgloss.Width(box)) / 2
+	y := (height - lipgloss.Height(box)) / 2
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	return lipgloss.NewLayer(box).X(x).Y(y)
 }
 
 // signModalLayer builds the centred panel shown while reading a sign or note.
@@ -625,7 +662,7 @@ func signModalLayer(text string, width, height int, removable bool) *lipgloss.La
 	if boxW < 10 {
 		boxW = 10
 	}
-	panelBg := lipgloss.Color("235")
+	panelBg := colorPanelBg
 	body := lipgloss.NewStyle().Foreground(colorCream).Background(panelBg).Width(boxW).Render(text)
 	footerText := "esc to close"
 	if removable {
@@ -633,8 +670,9 @@ func signModalLayer(text string, width, height int, removable bool) *lipgloss.La
 	}
 	footer := lipgloss.NewStyle().Foreground(colorAmberDim).Background(panelBg).Render(footerText)
 	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
+		Border(lipgloss.DoubleBorder()).
 		BorderForeground(colorAmber).
+		BorderBackground(panelBg).
 		Background(panelBg).
 		Padding(1, 2).
 		Render(body + "\n\n" + footer)
@@ -1172,7 +1210,12 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.SetWidth(composeInputWidth(m.width)) // keep compose wrap-width in sync
+		switch m.mode {
+		case inputModeSpeak:
+			m.input.SetWidth(composeInputWidth(m.width)) // keep the chat bar's wrap-width in sync
+		case inputModeBigChat:
+			m.input.SetWidth(bigChatContentWidth(m.width))
+		}
 	case gameSnapshotMsg:
 		// Adopt the new state and re-arm the receiver so the *next* snapshot
 		// also reaches us. Notes aren't in the snapshot (they change rarely and
@@ -1221,16 +1264,45 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				m.input.Reset()
 				m.input.Blur()
 				switch mode {
-				case inputModeSpeak:
-					if strings.TrimSpace(text) == "/help" {
+				case inputModeSpeak, inputModeBigChat:
+					// The chat bar (inline or full-screen) doubles as the command
+					// line. A leading slash runs a command: `/nick` and `/note`
+					// with no argument open their modal, with an argument they act.
+					cmd := strings.TrimSpace(text)
+					switch {
+					case cmd == "/help":
 						m.mode = inputModeHelp
-					} else {
+					case cmd == "/nick":
+						m.mode = inputModeRename
+						m.input.SetPromptFunc(0, firstLinePrompt(""))
+						m.setInputInPanel(true)
+						m.input.CharLimit = nickCharCap
+						m.input.SetWidth(composeModalW)
+						m.input.SetValue(getNick(m.player.ip))
+						m.input.CursorEnd()
+						return m, m.input.Focus()
+					case strings.HasPrefix(cmd, "/nick "):
+						theGame.rename(m.player, strings.TrimPrefix(cmd, "/nick "))
+					case cmd == "/note":
+						m.mode = inputModeNote
+						m.input.SetPromptFunc(0, firstLinePrompt(""))
+						m.setInputInPanel(true)
+						m.input.CharLimit = noteCharCap
+						m.input.SetWidth(composeModalW)
+						return m, m.input.Focus()
+					case strings.HasPrefix(cmd, "/note "):
+						theGame.addNote(m.player, strings.TrimPrefix(cmd, "/note "))
+					default:
 						theGame.say(m.player, text)
 					}
 				case inputModeRename:
 					theGame.rename(m.player, text)
 				case inputModeNote:
 					theGame.addNote(m.player, text)
+				}
+				if mode == inputModeBigChat && m.mode == inputModeMove {
+					m.mode = inputModeBigChat
+					return m, m.input.Focus()
 				}
 				return m, nil
 			}
@@ -1245,27 +1317,28 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			return m, func() tea.Msg { return ShowDirectoryMsg{} }
 		case "t":
 			m.mode = inputModeSpeak
-			m.input.Prompt = "say> "
+			m.input.SetPromptFunc(5, firstLinePrompt("say> "))
+			m.setInputInPanel(false)
 			m.input.CharLimit = sayCharCap
 			m.input.SetWidth(composeInputWidth(m.width))
 			return m, m.input.Focus()
-		case "n":
-			m.mode = inputModeRename
-			m.input.Prompt = "name> "
-			m.input.CharLimit = nickCharCap
+		case "/":
+			// Same as `t`, but pre-fill a slash so a command is one keypress away.
+			m.mode = inputModeSpeak
+			m.input.SetPromptFunc(5, firstLinePrompt("say> "))
+			m.setInputInPanel(false)
+			m.input.CharLimit = sayCharCap
 			m.input.SetWidth(composeInputWidth(m.width))
-			// Pre-fill with the current nick (if any) so the user can edit
-			// rather than retype. getNick reads under its own mutex, safe
-			// to call here.
-			m.input.SetValue(getNick(m.player.ip))
+			m.input.SetValue("/")
 			m.input.CursorEnd()
 			return m, m.input.Focus()
-		case "p":
-			// Compose a note to drop on the ground at our feet.
-			m.mode = inputModeNote
-			m.input.Prompt = "note> "
-			m.input.CharLimit = noteCharCap
-			m.input.SetWidth(composeInputWidth(m.width))
+		case "c":
+			// Open the full-screen chat view.
+			m.mode = inputModeBigChat
+			m.input.SetPromptFunc(2, firstLinePrompt("> "))
+			m.setInputInPanel(true)
+			m.input.CharLimit = sayCharCap
+			m.input.SetWidth(bigChatContentWidth(m.width))
 			return m, m.input.Focus()
 		case "i":
 			// Read what we're on or near. Read position from the snapshot (not
@@ -1327,14 +1400,18 @@ func (m gameScreen) View() string {
 
 	// The strip between map and chat is one divider row normally, but while
 	// composing it's the input, which soft-wraps and grows up to 3 rows. The map
-	// gives up those rows; the chat pane stays fixed. (The min-size gate above
-	// already bailed on tiny terminals, so this fits.)
-	composing := m.mode == inputModeSpeak || m.mode == inputModeRename || m.mode == inputModeNote
+	// gives up those rows; the chat pane stays fixed. The full chat (`c`) is a
+	// modal over a full-height map, so it reserves no chat rows at all.
+	bigChat := m.mode == inputModeBigChat
+	composing := m.mode == inputModeSpeak // only chat uses the inline bar; rename/note are modals
 	midH := 1
 	if composing {
 		midH = m.input.Height()
 	}
 	viewportH := m.height - chatLogLines - midH
+	if bigChat {
+		viewportH = m.height // map fills the screen behind the chat modal
+	}
 	viewportTilesW := m.width / 2
 	viewportTilesH := viewportH
 
@@ -1716,7 +1793,11 @@ func (m gameScreen) View() string {
 	// bottom, blank-padded to a fixed height.
 	chatBlock := renderChatLog(m.chat, m.width, chatLogLines)
 
-	base := strings.Join([]string{canvas.Render(), midBlock, chatBlock}, "\n")
+	mapView := canvas.Render()
+	base := strings.Join([]string{mapView, midBlock, chatBlock}, "\n")
+	if bigChat {
+		base = mapView // full-height map; the chat is a modal layered over it
+	}
 
 	// Compositor: the base text on the bottom, player nameplates layered over
 	// it. Speech is in the chat pane now (no floating bubbles), so nameplates
@@ -1777,7 +1858,96 @@ func (m gameScreen) View() string {
 	if m.mode == inputModeHelp {
 		layers = append(layers, signModalLayer(gameHelpText(), m.width, m.height, false))
 	}
+	if m.mode == inputModeRename {
+		layers = append(layers, composeModalLayer("New nickname", m.input.View(), "enter to set · esc to cancel", m.width, m.height))
+	}
+	if m.mode == inputModeNote {
+		layers = append(layers, composeModalLayer("New note", m.input.View(), "enter to drop · esc to cancel", m.width, m.height))
+	}
+	if bigChat {
+		layers = append(layers, bigChatModalLayer(m.chat, cellName, m.input.View(), m.width, m.height))
+	}
 	return lipgloss.NewCompositor(layers...).Render()
+}
+
+// bigChatModalLayer builds the large centred chat panel (the `c` view): a
+// double-bordered grey panel over the live map, with a header, the wrapped log
+// filling it, and the input at the bottom. esc closes it. Sized to leave a
+// margin of map around the edges, and its height never exceeds the terminal, so
+// the composite stays exactly `height` rows.
+func bigChatModalLayer(chat []gameChatLine, cellName, inputView string, width, height int) *lipgloss.Layer {
+	panelBg := colorPanelBg
+	contentW := bigChatContentWidth(width)
+	// Outer panel is height-4 tall (a 2-row map margin top and bottom). Inside,
+	// minus the two border rows, leaves height-6 rows for header + log + input.
+	innerH := height - 6
+	if innerH < 3 {
+		innerH = 3
+	}
+	inputH := lipgloss.Height(inputView)
+	logH := innerH - 1 - inputH // 1 row for the header
+	if logH < 1 {
+		logH = 1
+	}
+
+	pad := lipgloss.NewStyle().Width(contentW).Background(panelBg)
+	header := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(panelBg).Width(contentW).
+		Render("chat · " + cellName + " · esc to close")
+	body := header + "\n" + pad.Render(renderChatFull(chat, contentW, logH)) + "\n" + pad.Render(inputView)
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(colorAmber).
+		BorderBackground(panelBg).
+		Background(panelBg).
+		Padding(0, 1).
+		Render(body)
+	x := (width - lipgloss.Width(box)) / 2
+	y := (height - lipgloss.Height(box)) / 2
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	return lipgloss.NewLayer(box).X(x).Y(y)
+}
+
+// bigChatContentWidth is the inner text width of the big-chat panel — the panel
+// leaves roughly a 4-column map margin each side, minus its border and padding.
+func bigChatContentWidth(termWidth int) int {
+	w := termWidth - 12
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// renderChatFull renders the chat log wrapped to width, filling exactly `lines`
+// rows (newest at the bottom, blank-padded at the top). Unlike the docked
+// renderChatLog it wraps long messages instead of truncating — the expanded
+// view has the vertical room for it.
+func renderChatFull(chat []gameChatLine, width, lines int) string {
+	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(colorPanelBg)
+	textStyle := lipgloss.NewStyle().Foreground(colorCream).Background(colorPanelBg)
+	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true).Background(colorPanelBg)
+	wrap := lipgloss.NewStyle().Width(width).Background(colorPanelBg)
+
+	var rows []string
+	for _, line := range chat {
+		rendered := senderStyle.Render(line.from+": ") + textStyle.Render(line.text)
+		if line.from == "" {
+			rendered = systemStyle.Render("* " + line.text)
+		}
+		rows = append(rows, strings.Split(wrap.Render(rendered), "\n")...)
+	}
+	if len(rows) > lines {
+		rows = rows[len(rows)-lines:]
+	}
+	for len(rows) < lines {
+		rows = append([]string{""}, rows...)
+	}
+	return strings.Join(rows, "\n")
 }
 
 // renderChatLog formats the last `lines` chat messages into exactly `lines`
@@ -1833,6 +2003,26 @@ func truncateText(s string, max int) string {
 	return string(r) + "…"
 }
 
+// setInputInPanel gives the compose input the panel's grey background (when it's
+// inside a modal / the big-chat panel) or a transparent one (the docked bar,
+// which sits over the map). Without the grey, the cream text renders on the
+// terminal's default black and punches dark holes in the grey panels.
+func (m *gameScreen) setInputInPanel(inPanel bool) {
+	s := m.input.Styles()
+	text := lipgloss.NewStyle().Foreground(colorCream)
+	prompt := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	cursorLine := lipgloss.NewStyle()
+	if inPanel {
+		text = text.Background(colorPanelBg)
+		prompt = prompt.Background(colorPanelBg)
+		cursorLine = cursorLine.Background(colorPanelBg)
+	}
+	s.Focused.Text = text
+	s.Focused.Prompt = prompt
+	s.Focused.CursorLine = cursorLine
+	m.input.SetStyles(s)
+}
+
 // composeInputWidth sizes the bottom-line text input to roughly fill the
 // terminal width (leaving room for the prompt), with a floor for narrow ones.
 func composeInputWidth(termWidth int) int {
@@ -1841,6 +2031,18 @@ func composeInputWidth(termWidth int) int {
 		w = 20
 	}
 	return w
+}
+
+// firstLinePrompt builds a textarea prompt that shows `label` only on the first
+// visual row; wrapped continuation rows get blank padding (the textarea aligns
+// it to the prompt width) instead of repeating the label on every line.
+func firstLinePrompt(label string) func(textarea.PromptInfo) string {
+	return func(info textarea.PromptInfo) string {
+		if info.LineNumber == 0 {
+			return label
+		}
+		return ""
+	}
 }
 
 // othersContains keeps the type-switch in View readable — Go doesn't have
