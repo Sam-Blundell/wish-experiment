@@ -52,6 +52,8 @@ const (
 	maxGameChat     = 200 // per-world chat backlog kept in memory
 	chatLogLines    = 3   // chat lines shown in the docked (unexpanded) pane
 	composeModalW   = 40  // input width inside the rename / note modal
+	maxViewTilesW   = 56  // cap on the visible map width in tiles; larger terminals get a centred, framed column
+	maxViewTilesH   = 30  // cap on the visible map height in tiles
 )
 
 // inputMode enumerates the screen's keyboard modes. `iota` gives each
@@ -1331,7 +1333,22 @@ func moveDir(s string) (dx, dy int, ok bool) {
 // row sits below it). The camera is sized against this fixed value rather than
 // the mode-dependent height, so it doesn't lurch when the compose bar grows.
 func (m gameScreen) viewportTiles() (w, h int) {
-	return m.width / 2, m.height - chatLogLines - 1
+	w = m.width / 2
+	if w > maxViewTilesW {
+		w = maxViewTilesW
+	}
+	h = m.height - chatLogLines - 1
+	if h > maxViewTilesH {
+		h = maxViewTilesH
+	}
+	return w, h
+}
+
+// colW is the column's width in terminal cells (each tile is two cells). The
+// docked compose bar and chat pane size to this so they match the capped map.
+func (m gameScreen) colW() int {
+	w, _ := m.viewportTiles()
+	return w * 2
 }
 
 // clampCam eases one axis of the camera with the dead-zone rule: keep the player
@@ -1403,7 +1420,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		m.height = msg.Height
 		switch m.mode {
 		case inputModeSpeak:
-			m.input.SetWidth(composeInputWidth(m.width)) // keep the chat bar's wrap-width in sync
+			m.input.SetWidth(composeInputWidth(m.colW())) // keep the chat bar's wrap-width in sync
 		case inputModeBigChat:
 			m.input.SetWidth(bigChatContentWidth(m.width))
 			m.syncChatVPStick()
@@ -1562,7 +1579,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.input.SetPromptFunc(5, firstLinePrompt("say> "))
 			m.setInputInPanel(false)
 			m.input.CharLimit = sayCharCap
-			m.input.SetWidth(composeInputWidth(m.width))
+			m.input.SetWidth(composeInputWidth(m.colW()))
 			return m, m.input.Focus()
 		case "/":
 			// Same as `t`, but pre-fill a slash so a command is one keypress away.
@@ -1570,7 +1587,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.input.SetPromptFunc(5, firstLinePrompt("say> "))
 			m.setInputInPanel(false)
 			m.input.CharLimit = sayCharCap
-			m.input.SetWidth(composeInputWidth(m.width))
+			m.input.SetWidth(composeInputWidth(m.colW()))
 			m.input.SetValue("/")
 			m.input.CursorEnd()
 			return m, m.input.Focus()
@@ -1663,27 +1680,32 @@ func (m gameScreen) View() string {
 	if composing {
 		midH = m.input.Height()
 	}
-	viewportH := m.height - chatLogLines - midH
+	// The map view is capped (viewportTiles) so it can't sprawl across a big
+	// terminal; the whole map+divider+chat "column" is then centred in the
+	// terminal further down, with the void margins painted by a background layer.
+	// colW/colH are the column's fixed (resting) size.
+	viewportTilesW, restingMapTilesH := m.viewportTiles()
+	colW := viewportTilesW * 2
+	colH := restingMapTilesH + 1 + chatLogLines // map + divider + chat, constant
+
+	// Rows of map actually drawn this frame. The column height stays fixed:
+	// composing borrows rows from the map for the taller input; the big-chat
+	// modal uses the whole column as its backdrop (chat is the modal).
+	viewportTilesH := restingMapTilesH - (midH - 1)
 	if bigChat {
-		viewportH = m.height // map fills the screen behind the chat modal
+		viewportTilesH = colH
 	}
-	viewportTilesW := m.width / 2
-	viewportTilesH := viewportH
 
 	// The camera is dead-zone state, eased as the player moves in Update (see
 	// updateCamera) rather than recomputed here — that's what keeps it still
 	// while the player roams the middle of the screen, so most steps redraw just
-	// two tiles instead of the whole map. View only reads it. camX/camY are
-	// clamped to [0, world−viewport]; the worldOffset below centres worlds
-	// smaller than the viewport, where the camera pins to 0.
+	// two tiles instead of the whole map. View only reads it.
 	camX := m.camX
 	camY := m.camY
 
-	// When a world is smaller than the viewport, the camera clamps to 0
-	// above — but that leaves the world rendered against the top-left
-	// corner. Compute a per-axis offset in tile-units so we instead draw
-	// it centred on the screen. For larger worlds these stay zero and
-	// nothing changes from the previous behaviour.
+	// A world smaller than the (capped) viewport is centred within the column by
+	// a per-axis tile offset; larger worlds leave these zero. This is separate
+	// from the column-in-terminal centring computed below.
 	worldOffsetTilesX := 0
 	worldOffsetTilesY := 0
 	if curWorld.width < viewportTilesW {
@@ -1830,7 +1852,7 @@ func (m gameScreen) View() string {
 	// a string with embedded ANSI per glyph — Bubble Tea's renderer can
 	// then diff the buffer against the previous frame and only emit the
 	// cells that actually changed.
-	canvas := lipgloss.NewCanvas(m.width, viewportH)
+	canvas := lipgloss.NewCanvas(colW, viewportTilesH)
 	for y := 0; y < viewportTilesH; y++ {
 		for tx := 0; tx < viewportTilesW; tx++ {
 			// Screen tile → world tile. When the world is bigger than the
@@ -1983,7 +2005,7 @@ func (m gameScreen) View() string {
 			return // keep our own avatar visible through the leaves
 		}
 		cellX, cellY := worldToScreen(wx, wy)
-		if cellX < 0 || cellX+1 >= m.width || cellY < 0 || cellY >= viewportTilesH {
+		if cellX < 0 || cellX+1 >= colW || cellY < 0 || cellY >= viewportTilesH {
 			return
 		}
 		// Seed each half-cell from the world coord so the dapple is stable and
@@ -2037,7 +2059,7 @@ func (m gameScreen) View() string {
 		} else if _, ok := nearbySign(me); ok {
 			label += "· i read sign "
 		}
-		fill := m.width - lipgloss.Width(label)
+		fill := colW - lipgloss.Width(label)
 		if fill < 0 {
 			fill = 0
 		}
@@ -2046,7 +2068,7 @@ func (m gameScreen) View() string {
 
 	// Docked chat pane: the last few messages for this world, newest at the
 	// bottom, blank-padded to a fixed height.
-	chatBlock := renderChatLog(m.chat, m.width, chatLogLines)
+	chatBlock := renderChatLog(m.chat, colW, chatLogLines)
 
 	mapView := canvas.Render()
 	base := strings.Join([]string{mapView, midBlock, chatBlock}, "\n")
@@ -2054,10 +2076,35 @@ func (m gameScreen) View() string {
 		base = mapView // full-height map; the chat is a modal layered over it
 	}
 
+	// Centre the column in the terminal. The margins are filled by a void
+	// background layer below, so they can't flash on a resize.
+	marginX := (m.width - colW) / 2
+	marginY := (m.height - colH) / 2
+	if marginX < 0 {
+		marginX = 0
+	}
+	if marginY < 0 {
+		marginY = 0
+	}
+
 	// Compositor: the base text on the bottom, player nameplates layered over
 	// it. Speech is in the chat pane now (no floating bubbles), so nameplates
 	// and the read modal are the only overlays left.
-	layers := []*lipgloss.Layer{lipgloss.NewLayer(base)}
+	// Compose onto a void background sized to the whole terminal, with the column
+	// placed at its centred offset. The background paints the margins rather than
+	// leaving them to terminal background-erase, so a resize can't flash them.
+	voidBG := lipgloss.NewStyle().Width(m.width).Height(m.height).Background(colorVoid).Render("")
+	layers := []*lipgloss.Layer{lipgloss.NewLayer(voidBG)}
+	// When the column floats inside margins on a big terminal, frame it so its
+	// edges — especially the chat's bottom — don't blend into the void. The frame
+	// sits in the margin ring (the column content stays put), so it only appears
+	// when there's room for it: at least one cell of margin on every side.
+	if marginX >= 1 && marginY >= 1 {
+		boxed := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAmberDim).Render(base)
+		layers = append(layers, lipgloss.NewLayer(boxed).X(marginX-1).Y(marginY-1))
+	} else {
+		layers = append(layers, lipgloss.NewLayer(base).X(marginX).Y(marginY))
+	}
 
 	// onScreen reports whether a world tile is inside the current viewport.
 	onScreen := func(x, y int) bool {
@@ -2080,20 +2127,24 @@ func (m gameScreen) View() string {
 		if info.messageExpires.After(now) {
 			plateText, style = "! "+info.name, cueStyle
 		}
+		// worldToScreen is canvas-relative; add the column's margin to land on
+		// the centred column in the terminal.
 		playerCol, playerRow := worldToScreen(info.x, info.y)
-		// Prefer above the player, flip below if at the top of the canvas.
+		playerCol += marginX
+		playerRow += marginY
+		// Prefer above the player, flip below if it'd land in the top margin.
 		nameRow := playerRow - 1
-		if nameRow < 0 {
+		if nameRow < marginY {
 			nameRow = playerRow + 1
 		}
 		plate := style.Render(plateText)
 		plateW := lipgloss.Width(plate)
 		plateX := playerCol - (plateW-1)/2
-		if plateX < 0 {
-			plateX = 0
+		if plateX < marginX {
+			plateX = marginX
 		}
-		if plateX+plateW > m.width {
-			plateX = m.width - plateW
+		if plateX+plateW > marginX+colW {
+			plateX = marginX + colW - plateW
 		}
 		layers = append(layers, lipgloss.NewLayer(plate).X(plateX).Y(nameRow))
 	}

@@ -59,14 +59,11 @@ func (s aboutScreen) View() string {
 	// column. Each newline-separated string in the slice below becomes a
 	// paragraph; the empty strings are blank lines.
 	body := lipgloss.NewStyle().Foreground(colorCream).Width(contentWidth).Render(strings.Join([]string{
-		"Before the modern website there were bulletin board systems. Servers people dialed into over a phone line to read messages, chat, and play games.",
-		"Some were big professional operations with dozens of phone lines and thousands of users; many more were small boards run by a single host out of a spare room.",
+		"Before the web, people dialled into bulletin board systems over the phone line — single-host servers you connected to directly to read messages, chat, and play games.",
 		"",
-		"The barrier to entry filtered for people who actually wanted to be there. Communities formed around a particular host, a particular flavour, a particular set of door games.",
+		"This is an experiment in what that shape can still be, reached over SSH instead of a modem. There's nothing to sell and no plan to be useful, just a place to wander.",
 		"",
-		"This is an attempt to build a platform that could recapture some of that spirit using modern tools. There's nothing to sell and no plan to be useful, just a place to wander.",
-		"",
-		"I'll be adding to it slowly. Currently there's just a simple chat room, the next planned step is a more persistent messageboard.",
+		"The most developed part so far is the game — a small multiplayer overworld you can walk around while you talk to whoever else is connected. A persistent messageboard is still the plan; I'll be adding to it slowly.",
 		"",
 		"-Sam",
 	}, "\n"))
