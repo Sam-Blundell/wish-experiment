@@ -101,6 +101,13 @@ func main() {
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Printf("Starting SSH server on %s:%d", host, port)
+
+	// Start the world's heartbeat: one goroutine that drives every connected
+	// game session. It coalesces state changes into a steady broadcast (see
+	// game.tick) and is where ambient simulation will later live. It runs for
+	// the life of the process.
+	go theGame.tick()
+
 	// `go func() { ... }()` starts a *goroutine*: a lightweight thread
 	// managed by the Go runtime. The function literal is defined and then
 	// immediately invoked (the trailing `()`), but the `go` keyword means

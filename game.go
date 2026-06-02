@@ -38,18 +38,20 @@ import (
 // ----------------------------------------------------------------------------
 
 const (
-	gameMinWidth   = 80
-	gameMinHeight  = 24
-	worldWidth     = 120
-	worldHeight    = 60
-	gameMaxPlayers = 20
-	cueDuration    = 1500 * time.Millisecond // how long a speaker's nameplate flashes after they talk
-	sayCharCap     = 200
-	nickCharCap    = 16
-	noteCharCap    = 140
-	maxGameChat    = 200 // per-world chat backlog kept in memory
-	chatLogLines   = 3   // chat lines shown in the docked (unexpanded) pane
-	composeModalW  = 40  // input width inside the rename / note modal
+	gameMinWidth    = 80
+	gameMinHeight   = 24
+	worldWidth      = 120
+	worldHeight     = 60
+	gameMaxPlayers  = 20
+	cueDuration     = 1500 * time.Millisecond // how long a speaker's nameplate flashes after they talk
+	tickInterval    = 100 * time.Millisecond  // world heartbeat: rate the hub coalesces state changes into one broadcast
+	moveRepeatDelay = 200 * time.Millisecond  // enhanced terminals: pause after a press before the tick auto-glides a held key
+	sayCharCap      = 200
+	nickCharCap     = 16
+	noteCharCap     = 140
+	maxGameChat     = 200 // per-world chat backlog kept in memory
+	chatLogLines    = 3   // chat lines shown in the docked (unexpanded) pane
+	composeModalW   = 40  // input width inside the rename / note modal
 )
 
 // inputMode enumerates the screen's keyboard modes. `iota` gives each
@@ -772,6 +774,12 @@ type gamePlayer struct {
 	worldID        int // which world the player is currently in
 	x, y           int
 	messageExpires time.Time
+	// Movement intent for terminals that report key release (the enhanced path):
+	// the direction currently held, advanced one tile per tick until released.
+	// heldSince gates a short delay before the tick starts auto-gliding, so a
+	// quick tap moves exactly one tile. Zero direction = not moving. Guarded by mu.
+	heldDX, heldDY int
+	heldSince      time.Time
 }
 
 func (p *gamePlayer) displayName() string {
@@ -806,6 +814,7 @@ type game struct {
 	notes   []note                 // notes dropped on the ground; guarded by mu, persisted via store
 	store   NoteStore              // persistence backend for notes; wired up in notes.go's init
 	chat    map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
+	dirty   bool                   // state changed since the last tick; the tick loop broadcasts and clears it
 }
 
 var theGame = &game{
@@ -852,7 +861,7 @@ func (g *game) join(p *gamePlayer) bool {
 	}
 	g.players[p] = struct{}{}
 	g.appendChat(p.worldID, gameChatLine{text: p.displayName() + " arrived"})
-	g.broadcast()
+	g.markDirty()
 	return true
 }
 
@@ -903,15 +912,23 @@ func (g *game) leave(p *gamePlayer) {
 	}
 	delete(g.players, p)
 	g.appendChat(p.worldID, gameChatLine{text: p.displayName() + " left"})
-	g.broadcast()
+	g.markDirty()
 }
 
-// move validates the requested step and applies it if legal. Players
-// can't walk through tiles that aren't walkable or onto another player.
-// Stepping into a door tile teleports the player to the door's target.
+// move applies a keypress-driven step: the player pressed a direction. It takes
+// the lock and delegates to moveLocked. (The tick's held-movement calls
+// moveLocked directly, since it already holds the lock.)
 func (g *game) move(p *gamePlayer, dx, dy int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.moveLocked(p, dx, dy)
+}
+
+// moveLocked validates the requested step and applies it if legal. Players
+// can't walk through tiles that aren't walkable or onto another player.
+// Stepping into a door tile teleports the player to the door's target. Marks
+// the world dirty on a successful step. Caller holds g.mu.
+func (g *game) moveLocked(p *gamePlayer, dx, dy int) {
 	if _, ok := g.players[p]; !ok {
 		return
 	}
@@ -940,7 +957,7 @@ func (g *game) move(p *gamePlayer, dx, dy int) {
 		p.worldID = target.worldID
 		p.x = target.x
 		p.y = target.y
-		g.broadcast()
+		g.markDirty()
 		return
 	}
 
@@ -954,7 +971,32 @@ func (g *game) move(p *gamePlayer, dx, dy int) {
 		}
 	}
 	p.x, p.y = nx, ny
-	g.broadcast()
+	g.markDirty()
+}
+
+// setIntent records the direction a player is holding (enhanced terminals only)
+// and stamps the press time. The tick then advances them one tile per beat,
+// after moveRepeatDelay, until the key is released. Called once per physical
+// press — key repeats are ignored, since the tick drives continuation.
+func (g *game) setIntent(p *gamePlayer, dx, dy int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return
+	}
+	p.heldDX, p.heldDY = dx, dy
+	p.heldSince = time.Now()
+}
+
+// clearIntent stops held movement, but only if the released direction is the one
+// being held. Releasing a key already superseded by a newer press is a no-op —
+// last press wins, and we keep gliding in the newer direction.
+func (g *game) clearIntent(p *gamePlayer, dx, dy int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if p.heldDX == dx && p.heldDY == dy {
+		p.heldDX, p.heldDY = 0, 0
+	}
 }
 
 func (g *game) snapshot() gameSnapshot {
@@ -998,7 +1040,7 @@ func (g *game) rename(p *gamePlayer, newNick string) {
 		return
 	}
 	p.nick = newNick
-	g.broadcast()
+	g.markDirty()
 }
 
 // say posts a chat line to the speaker's current world and flashes a "just
@@ -1017,12 +1059,12 @@ func (g *game) say(p *gamePlayer, msg string) {
 	g.appendChat(p.worldID, gameChatLine{from: p.displayName(), text: msg})
 	p.messageExpires = time.Now().Add(cueDuration)
 	expires := p.messageExpires
-	g.broadcast()
+	g.markDirty()
 	g.mu.Unlock()
 
-	// Re-broadcast once the cue lapses so the flash clears even if the area is
-	// idle (nothing else would trigger a redraw). Skip if a newer say() has
-	// since pushed the expiry forward.
+	// Mark dirty once the cue lapses so the tick clears the flash even if the
+	// area is idle (nothing else would trigger a redraw). Skip if a newer say()
+	// has since pushed the expiry forward.
 	go func() {
 		time.Sleep(cueDuration + 10*time.Millisecond)
 		g.mu.Lock()
@@ -1031,7 +1073,7 @@ func (g *game) say(p *gamePlayer, msg string) {
 			return
 		}
 		if p.messageExpires.Equal(expires) {
-			g.broadcast()
+			g.markDirty()
 		}
 	}()
 }
@@ -1071,7 +1113,7 @@ func (g *game) addNote(p *gamePlayer, text string) {
 			log.Printf("notes: could not save: %v", err)
 		}
 	}
-	g.broadcast()
+	g.markDirty()
 }
 
 // removeNote deletes the note on the player's current tile — but only if they
@@ -1097,7 +1139,7 @@ func (g *game) removeNote(p *gamePlayer) {
 					log.Printf("notes: could not save: %v", err)
 				}
 			}
-			g.broadcast()
+			g.markDirty()
 			return
 		}
 	}
@@ -1116,10 +1158,58 @@ func (g *game) allNotes() []note {
 	return out
 }
 
-// broadcast snapshots state and pushes it to every player's send channel.
-// Caller holds g.mu. Non-blocking on a full channel — we drop rather than
-// stall the whole hub on one slow client. The next successful send carries
-// the latest state anyway, so a dropped snapshot is not a lost update.
+// markDirty records that shared state changed. Rather than broadcasting a fresh
+// snapshot on every single change (a move, a chat line, a note), callers just
+// flag the world dirty and the tick loop coalesces a burst of changes into one
+// broadcast on its next beat. This is what stops one player's movement from
+// forcing every other player to re-render on every step. Caller holds g.mu.
+func (g *game) markDirty() {
+	g.dirty = true
+}
+
+// tick is the world's heartbeat: one goroutine, started once at boot (see main),
+// that wakes every tickInterval and — only if something changed since the last
+// beat — broadcasts a single snapshot to everyone. Coalescing here caps the
+// broadcast (and therefore re-render) rate no matter how many players act or how
+// fast, and it's the loop ambient behaviour (day/night, critters) will hang off
+// later. Idle beats are nearly free: with nothing dirty we just take the lock,
+// see it's clean, and return.
+func (g *game) tick() {
+	t := time.NewTicker(tickInterval)
+	defer t.Stop()
+	for range t.C {
+		g.tickOnce()
+	}
+}
+
+// tickOnce is a single beat, split out from the loop so it can be driven
+// deterministically in tests. If anything changed since the last beat, send one
+// snapshot to everyone and clear the flag.
+func (g *game) tickOnce() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// Advance held-movement intents (enhanced terminals): one tile per beat in
+	// the direction each player holds, once past the initial moveRepeatDelay. A
+	// successful step marks dirty, so the broadcast below carries it. This is what
+	// makes a held key a steady, uniform glide — its speed is the tick rate, not
+	// the terminal's key-repeat rate.
+	now := time.Now()
+	for p := range g.players {
+		if (p.heldDX != 0 || p.heldDY != 0) && now.Sub(p.heldSince) >= moveRepeatDelay {
+			g.moveLocked(p, p.heldDX, p.heldDY)
+		}
+	}
+	if g.dirty {
+		g.broadcast()
+		g.dirty = false
+	}
+}
+
+// broadcast snapshots state and pushes it to every player's send channel. Called
+// only by the tick loop now — state changes flag dirty via markDirty rather than
+// broadcasting directly. Caller holds g.mu. Non-blocking on a full channel — we
+// drop rather than stall the whole hub on one slow client. The next successful
+// send carries the latest state anyway, so a dropped snapshot is not a lost update.
 func (g *game) broadcast() {
 	snap := g.buildSnapshot()
 	for p := range g.players {
@@ -1153,9 +1243,12 @@ type gameScreen struct {
 	mode        inputMode      // current keyboard mode (move / speak / rename / read / note)
 	input       textarea.Model // wrapping compose input for speak, rename and note modes
 	readingText string         // text shown in the modal (sign or note)
+	enhanced    bool           // terminal reports key release/repeat → smooth held-movement (else per-press)
+	lastMove    time.Time      // fallback path only: time of the last per-press move, to rate-cap movement
+	camX, camY  int            // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
 }
 
-func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
+func newGameScreen(s ssh.Session, ip string, width, height int, enhanced bool) Screen {
 	p := &gamePlayer{
 		// Buffered so a brief stall in the receiver doesn't block the
 		// broadcast goroutine. If the buffer fills we drop snapshots —
@@ -1196,7 +1289,7 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 	vp.Style = lipgloss.NewStyle().Background(colorPanelBg)
 	vp.MouseWheelDelta = 3
 
-	return gameScreen{
+	gs := gameScreen{
 		width:    width,
 		height:   height,
 		player:   p,
@@ -1205,13 +1298,102 @@ func newGameScreen(s ssh.Session, ip string, width, height int) Screen {
 		chat:     theGame.chatFor(worldOutdoor),
 		input:    ta,
 		chatVP:   vp,
+		enhanced: enhanced,
 	}
+	gs.centerCamera() // start centred on the spawn tile
+	return gs
 }
 
 func (m gameScreen) title() string { return "gametest" }
 
 func (m gameScreen) Init() tea.Cmd {
 	return gameWaitForSnap(m.player.send)
+}
+
+// moveDir maps a movement key (arrow, hjkl, or wasd) to a unit step. ok is false
+// for any other key. Shared by the press handler (which direction to step / hold)
+// and the release handler (which held direction to clear).
+func moveDir(s string) (dx, dy int, ok bool) {
+	switch s {
+	case "up", "k", "w":
+		return 0, -1, true
+	case "down", "j", "s":
+		return 0, 1, true
+	case "left", "h", "a":
+		return -1, 0, true
+	case "right", "l", "d":
+		return 1, 0, true
+	}
+	return 0, 0, false
+}
+
+// viewportTiles is the size of the map view in world-tiles, at rest (one divider
+// row sits below it). The camera is sized against this fixed value rather than
+// the mode-dependent height, so it doesn't lurch when the compose bar grows.
+func (m gameScreen) viewportTiles() (w, h int) {
+	return m.width / 2, m.height - chatLogLines - 1
+}
+
+// clampCam eases one axis of the camera with the dead-zone rule: keep the player
+// inside a central band of the viewport, scrolling only when they push past it,
+// and clamp to the world edges. If the world fits the viewport (max <= 0) the
+// camera pins to 0 and View centres it — that's the fixed-camera room, for free.
+func clampCam(cam, pos, vp, world int) int {
+	max := world - vp
+	if max <= 0 {
+		return 0
+	}
+	margin := vp / 4 // dead-zone = the central half; smaller = a tighter follow
+	if s := pos - cam; s < margin {
+		cam = pos - margin
+	} else if s > vp-1-margin {
+		cam = pos - (vp - 1 - margin)
+	}
+	if cam < 0 {
+		cam = 0
+	}
+	if cam > max {
+		cam = max
+	}
+	return cam
+}
+
+// centerCam puts the player in the middle of the viewport (clamped). Used when
+// there's no sensible previous camera to ease from — spawning, or stepping
+// through a door into a different world.
+func centerCam(pos, vp, world int) int {
+	max := world - vp
+	if max <= 0 {
+		return 0
+	}
+	cam := pos - vp/2
+	if cam < 0 {
+		cam = 0
+	}
+	if cam > max {
+		cam = max
+	}
+	return cam
+}
+
+// updateCamera eases the camera toward the local player (dead-zone). Called when
+// our position might have changed (a snapshot) or the viewport resized.
+func (m *gameScreen) updateCamera() {
+	me := m.snapshot[m.player]
+	w := worlds[me.worldID]
+	vpW, vpH := m.viewportTiles()
+	m.camX = clampCam(m.camX, me.x, vpW, w.width)
+	m.camY = clampCam(m.camY, me.y, vpH, w.height)
+}
+
+// centerCamera snaps the camera to centre the local player. Used at spawn and on
+// a world change, where easing from the old camera would be meaningless.
+func (m *gameScreen) centerCamera() {
+	me := m.snapshot[m.player]
+	w := worlds[me.worldID]
+	vpW, vpH := m.viewportTiles()
+	m.camX = centerCam(me.x, vpW, w.width)
+	m.camY = centerCam(me.y, vpH, w.height)
 }
 
 func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
@@ -1226,15 +1408,28 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.input.SetWidth(bigChatContentWidth(m.width))
 			m.syncChatVPStick()
 		}
+		m.updateCamera() // re-clamp to the new viewport (a now-smaller world re-centres)
 	case gameSnapshotMsg:
 		// Adopt the new state and re-arm the receiver so the *next* snapshot
 		// also reaches us. Notes aren't in the snapshot (they change rarely and
 		// we don't want to copy note text on every move), so we re-pull them
 		// from the hub whenever anything changes — a placement always triggers
 		// a broadcast, so this refresh sees it.
+		prevWorld, hadPrev := 0, false
+		if info, ok := m.snapshot[m.player]; ok {
+			prevWorld, hadPrev = info.worldID, true
+		}
 		m.snapshot = gameSnapshot(msg)
 		m.notes = theGame.allNotes()
-		m.chat = theGame.chatFor(msg[m.player].worldID)
+		me := msg[m.player]
+		m.chat = theGame.chatFor(me.worldID)
+		// Ease the camera toward us, but snap-centre on a world change (a door) —
+		// easing from the old world's camera would be meaningless.
+		if hadPrev && prevWorld == me.worldID {
+			m.updateCamera()
+		} else {
+			m.centerCamera()
+		}
 		if m.mode == inputModeBigChat {
 			m.syncChatVPStick()
 		}
@@ -1244,6 +1439,21 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		if m.mode == inputModeBigChat {
 			m.syncChatVP()
 			m.chatVP, _ = m.chatVP.Update(msg)
+		}
+		return m, nil
+	case tea.KeyboardEnhancementsMsg:
+		// Late arrival (usually it lands before the game is entered and reaches us
+		// via newGameScreen). Update our copy so held-movement turns on.
+		m.enhanced = msg.SupportsEventTypes()
+		return m, nil
+	case tea.KeyReleaseMsg:
+		// Only enhanced terminals send these. In movement mode, releasing the held
+		// direction ends the glide. We swallow releases in every mode so enabling
+		// the protocol can't leak release events into the text input.
+		if m.mode == inputModeMove && m.enhanced {
+			if dx, dy, ok := moveDir(msg.String()); ok {
+				theGame.clearIntent(m.player, dx, dy)
+			}
 		}
 		return m, nil
 	case tea.KeyPressMsg:
@@ -1390,14 +1600,25 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		case "?":
 			m.mode = inputModeHelp
 			return m, nil
-		case "up", "k", "w":
-			theGame.move(m.player, 0, -1)
-		case "down", "j", "s":
-			theGame.move(m.player, 0, 1)
-		case "left", "h", "a":
-			theGame.move(m.player, -1, 0)
-		case "right", "l", "d":
-			theGame.move(m.player, 1, 0)
+		default:
+			// Movement. On enhanced terminals the first press takes one immediate
+			// step and arms a held intent for the tick to glide from (repeats are
+			// ignored — the tick drives continuation); release stops it. Otherwise
+			// we just step on every press (and key-repeat), as before.
+			if dx, dy, ok := moveDir(msg.String()); ok {
+				if m.enhanced {
+					if !msg.Key().IsRepeat {
+						theGame.setIntent(m.player, dx, dy)
+						theGame.move(m.player, dx, dy)
+					}
+				} else if now := time.Now(); now.Sub(m.lastMove) >= tickInterval {
+					// Fallback (no key release): step on each press, but rate-capped
+					// to the tick cadence so a fast key-repeat can't outpace a slow
+					// one. The enhanced path doesn't need this — the tick paces it.
+					theGame.move(m.player, dx, dy)
+					m.lastMove = now
+				}
+			}
 		}
 	}
 	// Forward any unhandled message (e.g. cursor blink ticks while a
@@ -1449,24 +1670,14 @@ func (m gameScreen) View() string {
 	viewportTilesW := m.width / 2
 	viewportTilesH := viewportH
 
-	// Camera centred on the local player, clamped to the current world.
-	// Far-edge clamps come first so the >=0 clamp wins when the viewport
-	// is bigger than the world (which happens easily for the small
-	// interior cell).
-	camX := me.x - viewportTilesW/2
-	camY := me.y - viewportTilesH/2
-	if camX > curWorld.width-viewportTilesW {
-		camX = curWorld.width - viewportTilesW
-	}
-	if camY > curWorld.height-viewportTilesH {
-		camY = curWorld.height - viewportTilesH
-	}
-	if camX < 0 {
-		camX = 0
-	}
-	if camY < 0 {
-		camY = 0
-	}
+	// The camera is dead-zone state, eased as the player moves in Update (see
+	// updateCamera) rather than recomputed here — that's what keeps it still
+	// while the player roams the middle of the screen, so most steps redraw just
+	// two tiles instead of the whole map. View only reads it. camX/camY are
+	// clamped to [0, world−viewport]; the worldOffset below centres worlds
+	// smaller than the viewport, where the camera pins to 0.
+	camX := m.camX
+	camY := m.camY
 
 	// When a world is smaller than the viewport, the camera clamps to 0
 	// above — but that leaves the world rendered against the top-left

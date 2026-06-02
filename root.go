@@ -63,11 +63,12 @@ type EnterGameMsg struct{}
 // rule applies to types, functions, methods — capitalisation controls
 // visibility in Go.
 type rootModel struct {
-	active  Screen
-	session ssh.Session
-	ip      string
-	width   int
-	height  int
+	active   Screen
+	session  ssh.Session
+	ip       string
+	width    int
+	height   int
+	enhanced bool // terminal reports key release/repeat (Kitty protocol); passed to the game for smooth held-movement
 }
 
 // `newRoot` is a constructor function. Go has no constructors as a language
@@ -106,6 +107,11 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case tea.KeyboardEnhancementsMsg:
+		// The terminal answered our ReportEventTypes request (see View): record
+		// whether it'll report key release/repeat. We don't return — the active
+		// screen sees it too, in case it lands after the game is already entered.
+		m.enhanced = msg.SupportsEventTypes()
 	case ShowDirectoryMsg:
 		m.active = newDirectoryScreen(m.width, m.height)
 		return m, m.active.Init()
@@ -116,7 +122,7 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.active = newAboutScreen(m.width, m.height)
 		return m, m.active.Init()
 	case EnterGameMsg:
-		m.active = newGameScreen(m.session, m.ip, m.width, m.height)
+		m.active = newGameScreen(m.session, m.ip, m.width, m.height, m.enhanced)
 		return m, m.active.Init()
 	}
 
@@ -149,6 +155,13 @@ func (m rootModel) View() tea.View {
 	v.AltScreen = true
 	v.Cursor = nil
 	v.BackgroundColor = colorVoid
+	// Ask the terminal to report key repeat + release events. Where the Kitty
+	// keyboard protocol is supported this lets the game drive smooth, uniform
+	// held-movement (press = start, release = stop) instead of being at the mercy
+	// of the OS key-repeat rate; terminals without it ignore the request and fall
+	// back to per-press movement. What was negotiated arrives as a
+	// KeyboardEnhancementsMsg, handled in Update.
+	v.KeyboardEnhancements.ReportEventTypes = true
 	// Enable mouse reporting only while the game is active, so its big-chat log
 	// can be scrolled with the trackpad/wheel. (This is what makes terminal
 	// text-selection need Option held — scoping it to the game limits that to
