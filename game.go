@@ -38,22 +38,26 @@ import (
 // ----------------------------------------------------------------------------
 
 const (
-	gameMinWidth    = 80
-	gameMinHeight   = 24
-	worldWidth      = 120
-	worldHeight     = 60
-	gameMaxPlayers  = 20
-	cueDuration     = 1500 * time.Millisecond // how long a speaker's nameplate flashes after they talk
-	tickInterval    = 100 * time.Millisecond  // world heartbeat: rate the hub coalesces state changes into one broadcast
-	moveRepeatDelay = 200 * time.Millisecond  // enhanced terminals: pause after a press before the tick auto-glides a held key
-	sayCharCap      = 200
-	nickCharCap     = 16
-	noteCharCap     = 140
-	maxGameChat     = 200 // per-world chat backlog kept in memory
-	chatLogLines    = 3   // chat lines shown in the docked (unexpanded) pane
-	composeModalW   = 40  // input width inside the rename / note modal
-	maxViewTilesW   = 56  // cap on the visible map width in tiles; larger terminals get a centred, framed column
-	maxViewTilesH   = 30  // cap on the visible map height in tiles
+	gameMinWidth     = 80
+	gameMinHeight    = 24
+	worldWidth       = 120
+	worldHeight      = 60
+	gameMaxPlayers   = 20
+	cueDuration      = 4 * time.Second        // how long a speaker's nameplate blinks after they talk
+	cueBlinkInterval = 500 * time.Millisecond // the !↔name toggle period during that blink
+	tickInterval     = 100 * time.Millisecond // world heartbeat: rate the hub coalesces state changes into one broadcast
+	moveRepeatDelay  = 200 * time.Millisecond // enhanced terminals: pause after a press before the tick auto-glides a held key
+	dayCycle         = 20 * time.Minute       // full day↔night cycle (feel knob: shorter = more cycling per visit, longer = a slower world clock)
+	dayStages        = 8                      // discrete darkness levels around the cycle; the world re-renders only on a stage flip
+	maxNightDim      = 0.62                   // deepest darken fraction at the dead of night (0 = none, 1 = black)
+	sayCharCap       = 200
+	nickCharCap      = 16
+	noteCharCap      = 140
+	maxGameChat      = 200 // per-world chat backlog kept in memory
+	chatLogLines     = 3   // chat lines shown in the docked (unexpanded) pane
+	composeModalW    = 40  // input width inside the rename / note modal
+	maxViewTilesW    = 56  // cap on the visible map width in tiles; larger terminals get a centred, framed column
+	maxViewTilesH    = 30  // cap on the visible map height in tiles
 )
 
 // inputMode enumerates the screen's keyboard modes. `iota` gives each
@@ -811,12 +815,13 @@ type gameSnapshot map[*gamePlayer]gamePlayerInfo
 // the set of players. The world itself is the package-level `world` var
 // and isn't part of this struct because it's read-only.
 type game struct {
-	mu      sync.Mutex
-	players map[*gamePlayer]struct{}
-	notes   []note                 // notes dropped on the ground; guarded by mu, persisted via store
-	store   NoteStore              // persistence backend for notes; wired up in notes.go's init
-	chat    map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
-	dirty   bool                   // state changed since the last tick; the tick loop broadcasts and clears it
+	mu           sync.Mutex
+	players      map[*gamePlayer]struct{}
+	notes        []note                 // notes dropped on the ground; guarded by mu, persisted via store
+	store        NoteStore              // persistence backend for notes; wired up in notes.go's init
+	chat         map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
+	dirty        bool                   // state changed since the last tick; the tick loop broadcasts and clears it
+	lastDayStage int                    // last day/night stage broadcast; a change re-tints the world (see tickOnce)
 }
 
 var theGame = &game{
@@ -1045,7 +1050,7 @@ func (g *game) rename(p *gamePlayer, newNick string) {
 	g.markDirty()
 }
 
-// say posts a chat line to the speaker's current world and flashes a "just
+// say posts a chat line to the speaker's current world and blinks a "just
 // spoke" cue on their nameplate for cueDuration. The text lives in the world's
 // chat log (everyone in that cell sees it); the cue is just the visual ping.
 func (g *game) say(p *gamePlayer, msg string) {
@@ -1200,6 +1205,13 @@ func (g *game) tickOnce() {
 		if (p.heldDX != 0 || p.heldDY != 0) && now.Sub(p.heldSince) >= moveRepeatDelay {
 			g.moveLocked(p, p.heldDX, p.heldDY)
 		}
+		if p.messageExpires.After(now) {
+			g.dirty = true // keep a "just spoke" nameplate blinking while its cue is live
+		}
+	}
+	if st := dayStage(); st != g.lastDayStage {
+		g.lastDayStage = st
+		g.dirty = true // a day/night stage flip re-tints the world, even in an idle area
 	}
 	if g.dirty {
 		g.broadcast()
@@ -1306,7 +1318,7 @@ func newGameScreen(s ssh.Session, ip string, width, height int, enhanced bool) S
 	return gs
 }
 
-func (m gameScreen) title() string { return "gametest" }
+func (m gameScreen) title() string { return "game" }
 
 func (m gameScreen) Init() tea.Cmd {
 	return gameWaitForSnap(m.player.send)
@@ -1349,6 +1361,79 @@ func (m gameScreen) viewportTiles() (w, h int) {
 func (m gameScreen) colW() int {
 	w, _ := m.viewportTiles()
 	return w * 2
+}
+
+// dayPhase is the single source of truth for "what time is it" — a value in
+// [0,1) around the clock (0 = the cycle's darkest point). THIS is the swap seam:
+// accelerated for now (wall-clock modulo dayCycle). To switch to real wall-clock
+// day/night later, change only this body to (seconds since local midnight)/86400
+// — everything downstream is unchanged.
+func dayPhase() float64 {
+	return float64(time.Now().UnixNano()%int64(dayCycle)) / float64(dayCycle)
+}
+
+// dayDim is the night-darkness curve over the cycle: a trapezoid that sits at
+// full day or full night for most of it, with short dawn/dusk ramps between —
+// so the world spends the majority of the cycle settled, not mid-transition.
+// 0 = full day, 1 = deepest night; phase 0 is midnight.
+func dayDim(phase float64) float64 {
+	const dayFrac, nightFrac = 0.40, 0.40      // plateaus — 80% of the cycle
+	const ramp = (1 - dayFrac - nightFrac) / 2 // dawn / dusk, 0.10 each
+	switch {
+	case phase < nightFrac/2: // just after midnight — still full night
+		return 1
+	case phase < nightFrac/2+ramp: // dawn: night → day
+		return 1 - (phase-nightFrac/2)/ramp
+	case phase < nightFrac/2+ramp+dayFrac: // full day
+		return 0
+	case phase < nightFrac/2+ramp+dayFrac+ramp: // dusk: day → night
+		return (phase - (nightFrac/2 + ramp + dayFrac)) / ramp
+	default: // before midnight — full night again
+		return 1
+	}
+}
+
+// dayStage quantises the darkness curve to dayStages discrete levels (0 = day,
+// dayStages-1 = deepest night), so the world re-renders only when the level
+// flips — never during the long settled plateaus.
+func dayStage() int {
+	return int(dayDim(dayPhase())*float64(dayStages-1) + 0.5)
+}
+
+// nightDim is the darken fraction for the current stage: 0 by day, up to
+// maxNightDim at the dead of night.
+func nightDim() float64 {
+	return float64(dayStage()) / float64(dayStages-1) * maxNightDim
+}
+
+// timeOfDay is a short label for the divider — a plain-language clue for why the
+// colours are shifting. day/night for the plateaus, dawn/dusk for the ramps
+// (told apart by which side of noon we're on). Changes only on a stage flip, so
+// it costs no extra renders.
+func timeOfDay() string {
+	switch st := dayStage(); {
+	case st == 0:
+		return "day"
+	case st == dayStages-1:
+		return "night"
+	case dayPhase() < 0.5: // morning side, brightening
+		return "dawn"
+	default: // evening side, darkening
+		return "dusk"
+	}
+}
+
+// tintNight darkens a terrain style toward night by dim (skipping unset
+// colours). lipgloss.Darken does the per-channel work; we apply it only to the
+// world (terrain + canopy), so UI chrome and players stay at full brightness.
+func tintNight(s uv.Style, dim float64) uv.Style {
+	if s.Fg != nil {
+		s.Fg = lipgloss.Darken(s.Fg, dim)
+	}
+	if s.Bg != nil {
+		s.Bg = lipgloss.Darken(s.Bg, dim)
+	}
+	return s
 }
 
 // clampCam eases one axis of the camera with the dead-zone rule: keep the player
@@ -1852,6 +1937,13 @@ func (m gameScreen) View() string {
 	// a string with embedded ANSI per glyph — Bubble Tea's renderer can
 	// then diff the buffer against the previous frame and only emit the
 	// cells that actually changed.
+	// Day/night: how much to darken the world this frame (0 by day). Computed
+	// once and applied to terrain + canopy below; UI chrome and players stay
+	// bright. The stage is discrete, so this only changes — and triggers a
+	// re-render (see tickOnce) — every few minutes. At dim == 0 we skip tinting
+	// entirely, so daytime renders exactly as it did before day/night existed.
+	dim := nightDim()
+
 	canvas := lipgloss.NewCanvas(colW, viewportTilesH)
 	for y := 0; y < viewportTilesH; y++ {
 		for tx := 0; tx < viewportTilesW; tx++ {
@@ -1952,6 +2044,9 @@ func (m gameScreen) View() string {
 			default:
 				fill, leftRune = grassCell(wx, wy)
 			}
+			if dim > 0 {
+				fill = tintNight(fill, dim) // darken the resolved terrain toward night
+			}
 
 			// Players overlay the tile with their own glyph but keep the
 			// tile's background, so there's no black gap around them.
@@ -1995,7 +2090,11 @@ func (m gameScreen) View() string {
 		case 1:
 			glyph, fg = "▓", colorCanopyDark
 		}
-		return &uv.Cell{Content: glyph, Width: 1, Style: uv.Style{Fg: fg, Bg: colorCanopyBg}}
+		st := uv.Style{Fg: fg, Bg: colorCanopyBg}
+		if dim > 0 {
+			st = tintNight(st, dim) // leaves darken with the rest of the world
+		}
+		return &uv.Cell{Content: glyph, Width: 1, Style: st}
 	}
 	drawCanopyCell := func(wx, wy int) {
 		if wx < 0 || wx >= curWorld.width || wy < 0 || wy >= curWorld.height {
@@ -2053,7 +2152,7 @@ func (m gameScreen) View() string {
 	if composing {
 		midBlock = m.input.View()
 	} else {
-		label := fmt.Sprintf("══ %s · %d here ", cellName, visibleCount)
+		label := fmt.Sprintf("══ %s · %d here · %s ", cellName, visibleCount, timeOfDay())
 		if _, ok := noteUnder(m.notes, me); ok {
 			label += "· i read note "
 		} else if _, ok := nearbySign(me); ok {
@@ -2125,7 +2224,15 @@ func (m gameScreen) View() string {
 		}
 		plateText, style := info.name, nameStyle
 		if info.messageExpires.After(now) {
-			plateText, style = "! "+info.name, cueStyle
+			// "just spoke": blink the whole plate between "!" and the name in
+			// amber, toggling every cueBlinkInterval. messageExpires = spoke +
+			// cueDuration, so the time elapsed since speaking is cueDuration minus
+			// what's left.
+			style = cueStyle
+			elapsed := cueDuration - info.messageExpires.Sub(now)
+			if (elapsed/cueBlinkInterval)%2 == 0 {
+				plateText = "!"
+			}
 		}
 		// worldToScreen is canvas-relative; add the column's margin to land on
 		// the centred column in the terminal.

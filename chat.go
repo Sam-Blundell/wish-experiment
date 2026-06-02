@@ -12,7 +12,15 @@ import (
 )
 
 // ----------------------------------------------------------------------------
-// Chat: shared backend + per-session screen
+// Chat: the global "lobby" — the project's original screen
+//
+// Status: deliberately kept. This was the first thing the project had — a
+// single global chatroom. The game later grew its own chat (docked + big-chat),
+// which is per-world; this one stays because it's *global* (everyone, whatever
+// world they're in) and as a record of where the project started. Treat it as a
+// frozen artifact: superseded by the in-game chat for world-local talk, and not
+// the planned messageboard either — just the original lounge. It shares the
+// `nicks` map with the game (see HARD-EDGES).
 //
 // Unlike the other screens, chat has two halves:
 //
@@ -66,11 +74,11 @@ func (c *client) displayName() string {
 // Package-level state. `var ( ... )` mirrors the const block — these are
 // initialised once when the program starts.
 //
-//   chatRoom — the single global room. `&room{...}` takes the address of
-//              a struct literal, giving us a `*room`.
-//   nicksMu  — guards the `nicks` map. Separate from the room mutex so the
-//              two don't contend.
-//   nicks    — remembers a chosen nick across reconnects, keyed by IP.
+//	chatRoom — the single global room. `&room{...}` takes the address of
+//	           a struct literal, giving us a `*room`.
+//	nicksMu  — guards the `nicks` map. Separate from the room mutex so the
+//	           two don't contend.
+//	nicks    — remembers a chosen nick across reconnects, keyed by IP.
 var (
 	chatRoom = &room{
 		clients: make(map[*client]struct{}),
@@ -271,7 +279,7 @@ func chatWaitForMsg(sub chan chatMsg) tea.Cmd {
 // Init wires up the first chatWaitForMsg call. After this Bubble Tea has a
 // goroutine sitting in the channel receive; every time a message arrives
 // it lands in Update as a chatIncomingMsg.
-func (m chatScreen) title() string { return "chat" }
+func (m chatScreen) title() string { return "lobby" }
 
 func (m chatScreen) Init() tea.Cmd {
 	// Batch lets us return multiple commands from one place — Bubble Tea
