@@ -45,20 +45,23 @@ const (
 	worldWidth       = 120
 	worldHeight      = 60
 	gameMaxPlayers   = 20
-	cueDuration      = 4 * time.Second        // how long a speaker's nameplate blinks after they talk
-	cueBlinkInterval = 500 * time.Millisecond // the !↔name toggle period during that blink
-	tickInterval     = 100 * time.Millisecond // world heartbeat: rate the hub coalesces state changes into one broadcast
-	moveRepeatDelay  = 200 * time.Millisecond // enhanced terminals: pause after a press before the tick auto-glides a held key
-	dayCycle         = 20 * time.Minute       // full length of one accelerated day→night→day cycle; feel knob: shorter = more cycling, longer = slower world clock
-	dayStages        = 8                      // discrete darkness levels around the cycle; the world re-renders only on a stage flip
-	maxNightDim      = 0.62                   // deepest darken fraction at the dead of night (0 = none, 1 = black)
-	maxWarmth        = 0.35                   // strongest warm (sunset) cast, at the middle of a dawn/dusk ramp
-	warmGreenCut     = 0.18                   // warm pulls green down only a little (× warmth) — keep low or warm/brown tiles turn red
-	warmBlueCut      = 0.80                   // …and blue down more (× warmth) — this is what warms the scene without reddening it
-	lightRadius      = 6.5                    // tiles a light source reaches; spill falls off (smoothstep) to 0 here
-	lightWarmth      = 0.40                   // warm cast a light source adds at its centre
-	maxLift          = 0.65                   // most of the night's darkness a light can lift (1 = full daylight at the centre; <1 keeps it a glow)
-	glowStrength     = 0.85                   // how far a light source brightens toward its glow colour at deepest night
+	harvestTicks     = 8                       // tick beats to harvest one unit (~0.8s at tickInterval)
+	harvestGrace     = 1000 * time.Millisecond // how long a space press keeps a harvest "held"; > one harvest, so a tap yields one unit and holding streams
+	cueDuration      = 4 * time.Second         // how long a speaker's nameplate blinks after they talk
+	cueBlinkInterval = 500 * time.Millisecond  // the !↔name toggle period during that blink
+	tickInterval     = 100 * time.Millisecond  // world heartbeat: rate the hub coalesces state changes into one broadcast
+	moveRepeatDelay  = 200 * time.Millisecond  // enhanced terminals: pause after a press before the tick auto-glides a held key
+	waterShimmer     = 450 * time.Millisecond  // pond-ripple advance interval — the tick rebroadcasts when it ticks over (ambient water animation)
+	dayCycle         = 20 * time.Minute        // full length of one accelerated day→night→day cycle; feel knob: shorter = more cycling, longer = slower world clock
+	dayStages        = 8                       // discrete darkness levels around the cycle; the world re-renders only on a stage flip
+	maxNightDim      = 0.62                    // deepest darken fraction at the dead of night (0 = none, 1 = black)
+	maxWarmth        = 0.35                    // strongest warm (sunset) cast, at the middle of a dawn/dusk ramp
+	warmGreenCut     = 0.18                    // warm pulls green down only a little (× warmth) — keep low or warm/brown tiles turn red
+	warmBlueCut      = 0.80                    // …and blue down more (× warmth) — this is what warms the scene without reddening it
+	lightRadius      = 6.5                     // tiles a light source reaches; spill falls off (smoothstep) to 0 here
+	lightWarmth      = 0.40                    // warm cast a light source adds at its centre
+	maxLift          = 0.65                    // most of the night's darkness a light can lift (1 = full daylight at the centre; <1 keeps it a glow)
+	glowStrength     = 0.85                    // how far a light source brightens toward its glow colour at deepest night
 	sayCharCap       = 200
 	nickCharCap      = 16
 	noteCharCap      = 140
@@ -103,18 +106,20 @@ var (
 	// world reads as solid blocks instead of glyphs floating on the
 	// terminal's default (black) background. The *2 colours above are the
 	// detail-glyph foregrounds drawn over these fills.
-	colorGrassBg     = lipgloss.Color("#004800") // grass fill — dark green block
-	colorWaterBg     = lipgloss.Color("24")      // water fill — deep blue
-	colorWaterRipple = lipgloss.Color("74")      // ripple glyph drawn over water
-	colorShallowBg   = lipgloss.Color("31")      // lake shallows — lighter cyan-blue
-	colorShallowRip  = lipgloss.Color("117")     // ripple glyph over shallows
-	colorSandBg      = lipgloss.Color("180")     // beach — warm tan
-	colorSandSpeck   = lipgloss.Color("137")     // sand speckle glyph (darker tan)
-	colorMudBg       = lipgloss.Color("#43321f") // forest-pond bank — dark wet earth
-	colorMudSpeck    = lipgloss.Color("#5a4630") // mud speckle glyph (lighter earth)
-	colorDirtBg      = lipgloss.Color("#574028") // dirt path — dark trodden earth
-	colorDirtSpeck   = lipgloss.Color("#6e533a") // dirt speckle glyph (lighter pebbles)
-	colorWallTimber  = lipgloss.Color("#8a6038") // interior timber wall — brown glyph on black
+	colorGrassBg      = lipgloss.Color("#004800") // grass fill — dark green block
+	colorWaterBg      = lipgloss.Color("24")      // water fill — deep blue
+	colorWaterRipple  = lipgloss.Color("74")      // ripple glyph drawn over water
+	colorShallowBg    = lipgloss.Color("31")      // lake shallows — lighter cyan-blue
+	colorShallowRip   = lipgloss.Color("117")     // ripple glyph over shallows
+	colorWaterGlint   = lipgloss.Color("81")      // drifting crest glint on deep water (animated shimmer)
+	colorShallowGlint = lipgloss.Color("159")     // drifting crest glint on the shallows
+	colorSandBg       = lipgloss.Color("180")     // beach — warm tan
+	colorSandSpeck    = lipgloss.Color("137")     // sand speckle glyph (darker tan)
+	colorMudBg        = lipgloss.Color("#43321f") // forest-pond bank — dark wet earth
+	colorMudSpeck     = lipgloss.Color("#5a4630") // mud speckle glyph (lighter earth)
+	colorDirtBg       = lipgloss.Color("#574028") // dirt path — dark trodden earth
+	colorDirtSpeck    = lipgloss.Color("#6e533a") // dirt speckle glyph (lighter pebbles)
+	colorWallTimber   = lipgloss.Color("#8a6038") // interior timber wall — brown glyph on black
 
 	// Grass texture: a single dark base green with foreground tuft glyphs
 	// scattered over it and rare flowers, picked deterministically per tile
@@ -798,6 +803,13 @@ type gamePlayer struct {
 	// quick tap moves exactly one tile. Zero direction = not moving. Guarded by mu.
 	heldDX, heldDY int
 	heldSince      time.Time
+	// Gathering: carried materials, plus the held-harvest target + progress.
+	inv                inventory
+	harvestX, harvestY int
+	harvestUntil       time.Time
+	harvestProgress    int
+	harvesting         bool
+	typing             bool
 }
 
 func (p *gamePlayer) displayName() string {
@@ -811,10 +823,14 @@ func (p *gamePlayer) displayName() string {
 // in time. The broadcast snapshots build these so receivers don't hold
 // references to *gamePlayer fields, which the hub mutates under its lock.
 type gamePlayerInfo struct {
-	name           string
-	worldID        int
-	x, y           int
-	messageExpires time.Time // non-zero & future ⇒ flash the "just spoke" cue
+	name               string
+	worldID            int
+	x, y               int
+	messageExpires     time.Time // non-zero & future ⇒ flash the "just spoke" cue
+	inv                inventory
+	harvesting         bool // currently harvesting → flash a # on the target node
+	harvestX, harvestY int
+	typing             bool // composing a message → flash a grey … on the nameplate
 }
 
 // gameSnapshot is the message broadcast to every player after each state
@@ -827,13 +843,14 @@ type gameSnapshot map[*gamePlayer]gamePlayerInfo
 // the set of players. The world itself is the package-level `world` var
 // and isn't part of this struct because it's read-only.
 type game struct {
-	mu           sync.Mutex
-	players      map[*gamePlayer]struct{}
-	notes        []note                 // notes dropped on the ground; guarded by mu, persisted via store
-	store        NoteStore              // persistence backend for notes; wired up in notes.go's init
-	chat         map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
-	dirty        bool                   // state changed since the last tick; the tick loop broadcasts and clears it
-	lastDayStage int                    // last day/night stage broadcast; a change re-tints the world (see tickOnce)
+	mu            sync.Mutex
+	players       map[*gamePlayer]struct{}
+	notes         []note                 // notes dropped on the ground; guarded by mu, persisted via store
+	store         NoteStore              // persistence backend for notes; wired up in notes.go's init
+	chat          map[int][]gameChatLine // chat backlog per world (keyed by worldID); guarded by mu
+	dirty         bool                   // state changed since the last tick; the tick loop broadcasts and clears it
+	lastDayStage  int                    // last day/night stage broadcast; a change re-tints the world (see tickOnce)
+	lastWaterStep int                    // last pond-ripple step broadcast; a change animates the water surface (see tickOnce)
 }
 
 var theGame = &game{
@@ -1018,6 +1035,114 @@ func (g *game) clearIntent(p *gamePlayer, dx, dy int) {
 	}
 }
 
+// composingMode reports whether an input mode means the player is typing a
+// message — used to flash a grey "typing…" cue on their nameplate for others.
+func composingMode(m inputMode) bool {
+	return m == inputModeSpeak || m == inputModeBigChat || m == inputModeRename || m == inputModeNote
+}
+
+// setTyping records whether a player is composing and broadcasts on change so
+// nameplates update. Idempotent — a no-op when the state is unchanged.
+func (g *game) setTyping(p *gamePlayer, typing bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok || p.typing == typing {
+		return
+	}
+	p.typing = typing
+	g.dirty = true
+}
+
+// ----------------------------------------------------------------------------
+// Gathering (Phase 1: bare-hand harvest)
+//
+// Stand next to a tree or rock and hold space: the tick accumulates progress
+// while the hold is live (each space press re-arms it, so it works on enhanced
+// and key-repeat terminals alike) and on completion drops a unit into the
+// player's inventory. Bare-handed you only get scrap — sticks from trees, loose
+// stones from rocks — and the node is never depleted. Tools, real yields and
+// depletion come in later phases.
+// ----------------------------------------------------------------------------
+
+// inventory is a player's carried materials — a plain struct (not a map) so the
+// fields are typed and cheap to copy into snapshots.
+type inventory struct {
+	sticks      int
+	looseStones int
+	wood        int
+	stone       int
+}
+
+func (in inventory) empty() bool { return in == inventory{} }
+
+// short renders the non-zero counts for the status line.
+func (in inventory) short() string {
+	var parts []string
+	add := func(n int, name string) {
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, name))
+		}
+	}
+	add(in.wood, "wood")
+	add(in.stone, "stone")
+	add(in.sticks, "sticks")
+	add(in.looseStones, "loose stones")
+	return strings.Join(parts, " · ")
+}
+
+// isHarvestable reports whether a tile is a gatherable node.
+func isHarvestable(t tile) bool { return t == tileTree || t == tileRock }
+
+// startHarvest aims the player at an adjacent node and (re)arms the hold. Each
+// space press calls this; the tick (advanceHarvest) does the work while the hold
+// stays live. Switching to a new node resets progress.
+func (g *game) startHarvest(p *gamePlayer, tx, ty int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return
+	}
+	if p.harvestX != tx || p.harvestY != ty {
+		p.harvestX, p.harvestY = tx, ty
+		p.harvestProgress = 0
+	}
+	p.harvestUntil = time.Now().Add(harvestGrace)
+}
+
+// advanceHarvest is one beat of harvesting, called from the tick while it holds
+// g.mu. It progresses only while the hold is live and the player is still
+// 4-adjacent to the targeted node; on completion it drops a unit and resets
+// progress (so holding keeps yielding). Sets p.harvesting for the # flash.
+func (g *game) advanceHarvest(p *gamePlayer, now time.Time) {
+	w := worlds[p.worldID]
+	hx, hy := p.harvestX, p.harvestY
+	dx, dy := p.x-hx, p.y-hy
+	live := now.Before(p.harvestUntil) &&
+		dx*dx+dy*dy == 1 && // exactly one tile away (4-adjacent)
+		hy >= 0 && hy < w.height && hx >= 0 && hx < w.width &&
+		isHarvestable(w.tiles[hy][hx])
+	if !live {
+		if p.harvesting {
+			p.harvesting = false
+			g.dirty = true // broadcast the stop so the # flash clears promptly
+		}
+		p.harvestProgress = 0
+		return
+	}
+	p.harvesting = true
+	g.dirty = true // keep the # flash + inventory broadcasting while harvesting
+	p.harvestProgress++
+	if p.harvestProgress >= harvestTicks {
+		p.harvestProgress = 0
+		switch w.tiles[hy][hx] {
+		case tileTree:
+			p.inv.sticks++
+		case tileRock:
+			p.inv.looseStones++
+		}
+	}
+}
+
 func (g *game) snapshot() gameSnapshot {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1034,6 +1159,11 @@ func (g *game) buildSnapshot() gameSnapshot {
 			x:              p.x,
 			y:              p.y,
 			messageExpires: p.messageExpires,
+			inv:            p.inv,
+			harvesting:     p.harvesting,
+			harvestX:       p.harvestX,
+			harvestY:       p.harvestY,
+			typing:         p.typing,
 		}
 	}
 	return snap
@@ -1220,10 +1350,17 @@ func (g *game) tickOnce() {
 		if p.messageExpires.After(now) {
 			g.dirty = true // keep a "just spoke" nameplate blinking while its cue is live
 		}
+		g.advanceHarvest(p, now)
 	}
 	if st := dayStage(); st != g.lastDayStage {
 		g.lastDayStage = st
 		g.dirty = true // a day/night stage flip re-tints the world, even in an idle area
+	}
+	if len(g.players) > 0 {
+		if ws := waterStep(); ws != g.lastWaterStep {
+			g.lastWaterStep = ws
+			g.dirty = true // the pond ripple advanced — animate the water surface
+		}
 	}
 	if g.dirty {
 		g.broadcast()
@@ -1272,6 +1409,7 @@ type gameScreen struct {
 	enhanced    bool           // terminal reports key release/repeat → smooth held-movement (else per-press)
 	lastMove    time.Time      // fallback path only: time of the last per-press move, to rate-cap movement
 	camX, camY  int            // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
+	sentTyping  bool           // last typing state reported to the hub (so we only re-lock on change)
 }
 
 func newGameScreen(s ssh.Session, ip string, width, height int, enhanced bool) Screen {
@@ -1400,6 +1538,30 @@ func init() { debugPhaseBits.Store(math.Float64bits(-1)) } // default: the live 
 
 // setDebugPhase pins the clock to phase p; a negative p resumes the live cycle.
 func setDebugPhase(p float64) { debugPhaseBits.Store(math.Float64bits(p)) }
+
+// waterStep is a coarse clock (a few steps a second) driving the pond-ripple
+// animation. Like dayStage, the tick watches it: when it ticks over, the hub
+// rebroadcasts so the shimmer advances. Wall-clock derived, so every session
+// animates in lockstep with no shared state.
+func waterStep() int {
+	return int(time.Now().UnixNano() / int64(waterShimmer))
+}
+
+// rippleCell animates a water tile. As waterStep advances, a diagonal band drifts
+// across the surface: a crest band brightens to the glint colour (rippling on
+// both half-cells), a calm band goes smooth, and the rest show the normal ripple.
+// Returns the (possibly recoloured) style and the two half-cell glyphs.
+func rippleCell(base uv.Style, glint color.Color, wx, wy int) (uv.Style, string, string) {
+	switch (wx + 2*wy + waterStep()) % 8 {
+	case 0, 1:
+		base.Fg = glint
+		return base, "~", "~" // crest: a brighter glint, both halves ripple
+	case 4, 5:
+		return base, " ", " " // calm: a smooth patch, no ripple
+	default:
+		return base, "~", " " // the normal ripple
+	}
+}
 
 // dayDim is the night-darkness curve over the cycle: a trapezoid that sits at
 // full day or full night for most of it, with short dawn/dusk ramps between —
@@ -1591,7 +1753,23 @@ func (m *gameScreen) centerCamera() {
 	m.camY = centerCam(me.y, vpH, w.height)
 }
 
+// Update wraps the screen's message handling and then syncs the player's
+// "typing" state to the hub, so entering or leaving any compose mode flips the
+// grey "…" nameplate cue for everyone — without scattering setTyping calls
+// across every input branch.
 func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
+	next, cmd := m.update(msg)
+	if gs, ok := next.(gameScreen); ok {
+		if t := composingMode(gs.mode); t != gs.sentTyping {
+			theGame.setTyping(gs.player, t)
+			gs.sentTyping = t
+			next = gs
+		}
+	}
+	return next, cmd
+}
+
+func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1662,7 +1840,7 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 		// reading a sign just closes the modal).
 		if m.mode == inputModeRead {
 			switch msg.String() {
-			case "esc", "i", "enter", "q", " ":
+			case "esc", "i", "enter", "q", "space":
 				m.mode = inputModeMove
 				m.readingText = ""
 			case "x":
@@ -1821,6 +1999,19 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 			return m, nil
 		case "?":
 			m.mode = inputModeHelp
+			return m, nil
+		case "space":
+			// Hold space to harvest an adjacent tree/rock (bare hands → sticks /
+			// loose stones). Each press re-arms the hold; the tick does the work.
+			me := m.snapshot[m.player]
+			w := worlds[me.worldID]
+			for _, d := range [][2]int{{0, -1}, {0, 1}, {-1, 0}, {1, 0}} {
+				nx, ny := me.x+d[0], me.y+d[1]
+				if nx >= 0 && nx < w.width && ny >= 0 && ny < w.height && isHarvestable(w.tiles[ny][nx]) {
+					theGame.startHarvest(m.player, nx, ny)
+					break
+				}
+			}
 			return m, nil
 		default:
 			// Movement. On enhanced terminals the first press takes one immediate
@@ -2097,6 +2288,16 @@ func (m gameScreen) View() string {
 		return best * best * (3 - 2*best) // smoothstep: soft glow that fades to nothing at the edge
 	}
 
+	// Coords being harvested by anyone in this world flash a # (blinking like the
+	// speech cue), built from the snapshot so it's race-free.
+	harvestFlash := map[[2]int]bool{}
+	if (time.Now().UnixNano()/int64(cueBlinkInterval))%2 == 0 {
+		for _, info := range m.snapshot {
+			if info.harvesting && info.worldID == me.worldID {
+				harvestFlash[[2]int{info.harvestX, info.harvestY}] = true
+			}
+		}
+	}
 	canvas := lipgloss.NewCanvas(colW, viewportTilesH)
 	for y := 0; y < viewportTilesH; y++ {
 		for tx := 0; tx < viewportTilesW; tx++ {
@@ -2128,9 +2329,9 @@ func (m gameScreen) View() string {
 					fill, leftRune, rightRune = trunkFill, "▐", "▌"
 				}
 			case tileWater:
-				fill, leftRune = waterFill, "~"
+				fill, leftRune, rightRune = rippleCell(waterFill, colorWaterGlint, wx, wy)
 			case tileShallow:
-				fill, leftRune = shallowFill, "~"
+				fill, leftRune, rightRune = rippleCell(shallowFill, colorShallowGlint, wx, wy)
 			case tileSand:
 				// Mostly bare tan with the occasional darker speck so the
 				// beach isn't a flat block.
@@ -2226,6 +2427,9 @@ func (m gameScreen) View() string {
 				// marker — the help line tells you it's there to read.
 				left = &uv.Cell{Content: "▤", Width: 1, Style: uv.Style{Fg: colorNote, Bg: fill.Bg, Attrs: uv.AttrBold}}
 				right = &uv.Cell{Content: " ", Width: 1, Style: uv.Style{Bg: fill.Bg}}
+			case harvestFlash[[2]int{wx, wy}]:
+				left = &uv.Cell{Content: "#", Width: 1, Style: uv.Style{Fg: colorAmber, Bg: fill.Bg, Attrs: uv.AttrBold}}
+				right = &uv.Cell{Content: " ", Width: 1, Style: uv.Style{Bg: fill.Bg}}
 			default:
 				left = &uv.Cell{Content: leftRune, Width: 1, Style: fill}
 				right = &uv.Cell{Content: rightRune, Width: 1, Style: fill}
@@ -2320,6 +2524,9 @@ func (m gameScreen) View() string {
 		} else if _, ok := nearbySign(me); ok {
 			label += "· i read sign "
 		}
+		if inv := me.inv; !inv.empty() {
+			label += "· " + inv.short() + " "
+		}
 		fill := colW - lipgloss.Width(label)
 		if fill < 0 {
 			fill = 0
@@ -2380,12 +2587,20 @@ func (m gameScreen) View() string {
 	now := time.Now()
 	nameStyle := lipgloss.NewStyle().Foreground(colorNameplate)
 	cueStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	typingStyle := lipgloss.NewStyle().Foreground(colorPlayerOther) // grey "…" while composing
 	for _, info := range m.snapshot {
 		if info.worldID != me.worldID || info.name == "" || !onScreen(info.x, info.y) {
 			continue
 		}
 		plateText, style := info.name, nameStyle
-		if info.messageExpires.After(now) {
+		switch {
+		case info.typing:
+			// "typing…": blink the plate between "…" and the name, in grey.
+			style = typingStyle
+			if (now.UnixNano()/int64(cueBlinkInterval))%2 == 0 {
+				plateText = "…"
+			}
+		case info.messageExpires.After(now):
 			// "just spoke": blink the whole plate between "!" and the name in
 			// amber, toggling every cueBlinkInterval. messageExpires = spoke +
 			// cueDuration, so the time elapsed since speaking is cueDuration minus

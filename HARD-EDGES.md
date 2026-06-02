@@ -121,6 +121,30 @@ current rune + `switch` + procedural-fill model doesn't expose. So the entity
 catalogue earns its place on rendering grounds *and* unblocks the tool — making it
 a strong candidate for what the rewrite is organised around.
 
+### The frame is rebuilt and double-buffered every render — alloc-bound · [lived]
+`gameScreen.View` builds the whole frame from scratch each render: a lipgloss
+canvas of ~3.4k cells rendered to a string (`Canvas.Render`), then re-composited
+with the void-margin background and floating nameplates in a *second* full pass
+(`Compositor.Render`). Profiled (M2, day): the build is **~2 ms but allocates
+~1.67 MB across ~11k objects per frame**, nearly all immediately garbage — so the
+CPU profile is dominated by GC (`runtime.madvise` etc.), not by our drawing.
+`ultraviolet.NewBuffer` is ~56% of the bytes (each `Render` allocates a fresh
+screen-sized buffer), string-building ~28%; the **compositor's second pass alone is
+~42%** of allocations. Night adds only ~8% — the per-cell tint and light scan are
+minor, the structural alloc path is the whole cost. Live it's ~4–7 ms once Bubble
+Tea's output diff, the SSH write and cold-cache effects are added.
+
+The saving grace is the cursed renderer's **output** diff: it transmits only the
+cells that *changed*, so a still scene ships ~0 bytes and bandwidth stays cheap (the
+living-water shimmer confirmed this — a waterless player transmits nothing). But the
+*build* is full every frame regardless, so what bounds CPU is render *frequency* —
+driven by movement, and now the ambient water tick (~2.2 renders/s per connected
+session).
+**Rewrite:** a retained / dirty-region renderer that reuses one persistent buffer
+and rebuilds only changed cells, compositing in a single pass (the second buffer is
+dead weight). This pairs naturally with the data-driven entity catalogue — an entity
+renderer can track what's dirty per cell instead of re-deriving the whole frame.
+
 ## Persistence
 
 ### Notes are saved while holding the game lock · [lived]
