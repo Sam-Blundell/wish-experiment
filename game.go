@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"log"
 	"math"
 	"math/rand"
@@ -47,9 +48,16 @@ const (
 	cueBlinkInterval = 500 * time.Millisecond // the !↔name toggle period during that blink
 	tickInterval     = 100 * time.Millisecond // world heartbeat: rate the hub coalesces state changes into one broadcast
 	moveRepeatDelay  = 200 * time.Millisecond // enhanced terminals: pause after a press before the tick auto-glides a held key
-	dayCycle         = 20 * time.Minute       // full day↔night cycle (feel knob: shorter = more cycling per visit, longer = a slower world clock)
+	dayCycle         = 20 * time.Minute       // full length of one accelerated day→night→day cycle; feel knob: shorter = more cycling, longer = slower world clock
 	dayStages        = 8                      // discrete darkness levels around the cycle; the world re-renders only on a stage flip
 	maxNightDim      = 0.62                   // deepest darken fraction at the dead of night (0 = none, 1 = black)
+	maxWarmth        = 0.35                   // strongest warm (sunset) cast, at the middle of a dawn/dusk ramp
+	warmGreenCut     = 0.18                   // warm pulls green down only a little (× warmth) — keep low or warm/brown tiles turn red
+	warmBlueCut      = 0.80                   // …and blue down more (× warmth) — this is what warms the scene without reddening it
+	lightRadius      = 6.5                    // tiles a light source reaches; spill falls off (smoothstep) to 0 here
+	lightWarmth      = 0.40                   // warm cast a light source adds at its centre
+	maxLift          = 0.65                   // most of the night's darkness a light can lift (1 = full daylight at the centre; <1 keeps it a glow)
+	glowStrength     = 0.85                   // how far a light source brightens toward its glow colour at deepest night
 	sayCharCap       = 200
 	nickCharCap      = 16
 	noteCharCap      = 140
@@ -130,6 +138,7 @@ var (
 	colorTimberBg   = lipgloss.Color("#7b5a3a") // log wall
 	colorTimberLine = lipgloss.Color("#5a4028") // log courses (grooves)
 	colorWindowBg   = lipgloss.Color("#e7c24f") // lit window — warm glow
+	colorWindowGlow = lipgloss.Color("#fff2c4") // window glow target as night falls (brighter, warmer)
 	colorDoorBg     = lipgloss.Color("#3f2a16") // door — dark wood
 	colorDoorPlank  = lipgloss.Color("#7a5230") // door plank seam (lighter)
 
@@ -1400,10 +1409,15 @@ func dayStage() int {
 	return int(dayDim(dayPhase())*float64(dayStages-1) + 0.5)
 }
 
-// nightDim is the darken fraction for the current stage: 0 by day, up to
-// maxNightDim at the dead of night.
-func nightDim() float64 {
-	return float64(dayStage()) / float64(dayStages-1) * maxNightDim
+// dayTint returns the night darkening and the dawn/dusk warmth for the current
+// stage: dim ramps 0→maxNightDim toward midnight; warmth peaks mid-transition
+// (dawn/dusk) and falls to 0 at both full day and full night — so the ramps read
+// like a warm sunrise/sunset rather than a flat dimming.
+func dayTint() (dim, warmth float64) {
+	frac := float64(dayStage()) / float64(dayStages-1) // 0 = day … 1 = deepest night
+	dim = frac * maxNightDim
+	warmth = (1 - math.Abs(2*frac-1)) * maxWarmth
+	return
 }
 
 // timeOfDay is a short label for the divider — a plain-language clue for why the
@@ -1423,17 +1437,76 @@ func timeOfDay() string {
 	}
 }
 
-// tintNight darkens a terrain style toward night by dim (skipping unset
-// colours). lipgloss.Darken does the per-channel work; we apply it only to the
-// world (terrain + canopy), so UI chrome and players stay at full brightness.
-func tintNight(s uv.Style, dim float64) uv.Style {
+// mix blends colour a toward b by f in [0,1] — a single linear step (lipgloss's
+// Blend1D is gradient-oriented, so we lerp the channels ourselves). RGBA() gives
+// 16-bit channels; /257 brings them back to 8-bit.
+func mix(a, b color.Color, f float64) color.Color {
+	ar, ag, ab, _ := a.RGBA()
+	br, bg, bb, _ := b.RGBA()
+	ch := func(x, y uint32) uint8 { return uint8((float64(x)*(1-f) + float64(y)*f) / 257) }
+	return lipgloss.RGBColor{R: ch(ar, br), G: ch(ag, bg), B: ch(ab, bb)}
+}
+
+// warmMul warms a colour by pulling its cool channels down (green a little, blue
+// more) in proportion to warmth — a "warm light" tint. Crucially it *scales*
+// each channel rather than blending toward one orange, so the contrast between
+// tiles (what keeps the path readable) is preserved. The old blend-toward-orange
+// collapsed that and washed detail out at dawn/dusk.
+func warmMul(c color.Color, warmth float64) color.Color {
+	r, g, b, _ := c.RGBA()
+	gs := math.Max(0, 1-warmth*warmGreenCut)
+	bs := math.Max(0, 1-warmth*warmBlueCut)
+	return lipgloss.RGBColor{
+		R: uint8(r >> 8),
+		G: uint8(uint32(float64(g)*gs) >> 8),
+		B: uint8(uint32(float64(b)*bs) >> 8),
+	}
+}
+
+// tintNight applies the night look to a terrain style: darken toward black by
+// dim, then a warm dawn/dusk cast by warmth. Unset colours are left alone. Only
+// the world (terrain + canopy) is tinted, so UI chrome and players stay bright.
+func tintNight(s uv.Style, dim, warmth float64) uv.Style {
+	f := func(c color.Color) color.Color {
+		c = lipgloss.Darken(c, dim)
+		if warmth > 0 {
+			c = warmMul(c, warmth)
+		}
+		return c
+	}
 	if s.Fg != nil {
-		s.Fg = lipgloss.Darken(s.Fg, dim)
+		s.Fg = f(s.Fg)
 	}
 	if s.Bg != nil {
-		s.Bg = lipgloss.Darken(s.Bg, dim)
+		s.Bg = f(s.Bg)
 	}
 	return s
+}
+
+// glowNight makes a light source brighten as night falls instead of dimming with
+// the world: blend toward colorWindowGlow by dim, so a window reads as lit
+// against the dark. (dim is 0 by day, so this is a no-op then.)
+func glowNight(s uv.Style, dim float64) uv.Style {
+	g := dim * glowStrength
+	if s.Fg != nil {
+		s.Fg = mix(s.Fg, colorWindowGlow, g)
+	}
+	if s.Bg != nil {
+		s.Bg = mix(s.Bg, colorWindowGlow, g)
+	}
+	return s
+}
+
+// isStructure reports whether a tile is part of a building's solid body, so
+// light pools on the ground around it rather than washing over its roof and
+// walls. Windows are handled separately (they glow); doors and floors are
+// openings/ground, so they're not exempt.
+func isStructure(t tile) bool {
+	switch t {
+	case tileRoof, tileRidge, tileTimber, tileWall:
+		return true
+	}
+	return false
 }
 
 // clampCam eases one axis of the camera with the dead-zone rule: keep the player
@@ -1937,12 +2010,45 @@ func (m gameScreen) View() string {
 	// a string with embedded ANSI per glyph — Bubble Tea's renderer can
 	// then diff the buffer against the previous frame and only emit the
 	// cells that actually changed.
-	// Day/night: how much to darken the world this frame (0 by day). Computed
-	// once and applied to terrain + canopy below; UI chrome and players stay
-	// bright. The stage is discrete, so this only changes — and triggers a
-	// re-render (see tickOnce) — every few minutes. At dim == 0 we skip tinting
-	// entirely, so daytime renders exactly as it did before day/night existed.
-	dim := nightDim()
+	// Day/night: the night darkening + dawn/dusk warmth for this frame (both 0 by
+	// day). Computed once and applied to terrain + canopy below; UI chrome and
+	// players stay bright, and light sources (windows) glow instead. The stage is
+	// discrete, so these only change — and trigger a re-render (see tickOnce) —
+	// every few minutes. At dim == 0 we skip tinting, so daytime renders exactly
+	// as before.
+	dim, warmth := dayTint()
+
+	// Static light spill: at night, gather the light-source tiles near the
+	// viewport (just windows for now) so each cell can be lit by the nearest one
+	// — less dim and warmer the closer it is (lightAt returns 0..1). It's cheap,
+	// and the sources are static, so it adds nothing to movement within the
+	// dead-zone: the lit pattern is fixed on screen until the camera scrolls.
+	var sources [][2]int
+	if dim > 0 {
+		r := int(math.Ceil(lightRadius)) + 1
+		for sy := camY - r; sy < camY+viewportTilesH+r; sy++ {
+			if sy < 0 || sy >= curWorld.height {
+				continue
+			}
+			for sx := camX - r; sx < camX+viewportTilesW+r; sx++ {
+				if sx >= 0 && sx < curWorld.width && curWorld.tiles[sy][sx] == tileWindow {
+					sources = append(sources, [2]int{sx, sy})
+				}
+			}
+		}
+	}
+	lightAt := func(wx, wy int) float64 {
+		best := 0.0
+		for _, s := range sources {
+			if t := 1 - math.Hypot(float64(wx-s[0]), float64(wy-s[1]))/lightRadius; t > best {
+				best = t
+			}
+		}
+		if best <= 0 {
+			return 0
+		}
+		return best * best * (3 - 2*best) // smoothstep: soft glow that fades to nothing at the edge
+	}
 
 	canvas := lipgloss.NewCanvas(colW, viewportTilesH)
 	for y := 0; y < viewportTilesH; y++ {
@@ -2045,7 +2151,15 @@ func (m gameScreen) View() string {
 				fill, leftRune = grassCell(wx, wy)
 			}
 			if dim > 0 {
-				fill = tintNight(fill, dim) // darken the resolved terrain toward night
+				if curWorld.tiles[wy][wx] == tileWindow {
+					fill = glowNight(fill, dim) // a lit window brightens as night falls
+				} else {
+					l := lightAt(wx, wy)
+					if isStructure(curWorld.tiles[wy][wx]) {
+						l = 0 // light pools on the ground, not over the building itself
+					}
+					fill = tintNight(fill, dim*(1-l*maxLift), math.Max(warmth, l*lightWarmth))
+				}
 			}
 
 			// Players overlay the tile with their own glyph but keep the
@@ -2082,7 +2196,7 @@ func (m gameScreen) View() string {
 	// leafCell renders one foliage half-cell: a stipple glyph (light ░ / mid
 	// ▒ / dark ▓) over the canopy fill, picked from a seed so the leaves look
 	// dappled rather than a flat block.
-	leafCell := func(seed uint32) *uv.Cell {
+	leafCell := func(seed uint32, l float64) *uv.Cell {
 		glyph, fg := "▒", colorCanopy
 		switch seed % 4 {
 		case 0:
@@ -2092,7 +2206,7 @@ func (m gameScreen) View() string {
 		}
 		st := uv.Style{Fg: fg, Bg: colorCanopyBg}
 		if dim > 0 {
-			st = tintNight(st, dim) // leaves darken with the rest of the world
+			st = tintNight(st, dim*(1-l*maxLift), math.Max(warmth, l*lightWarmth)) // lit by nearby sources too
 		}
 		return &uv.Cell{Content: glyph, Width: 1, Style: st}
 	}
@@ -2110,8 +2224,9 @@ func (m gameScreen) View() string {
 		// Seed each half-cell from the world coord so the dapple is stable and
 		// the tile's two halves differ.
 		h := grassHash(wx, wy)
-		canvas.SetCell(cellX, cellY, leafCell(h))
-		canvas.SetCell(cellX+1, cellY, leafCell(h*2654435761+1))
+		l := lightAt(wx, wy)
+		canvas.SetCell(cellX, cellY, leafCell(h, l))
+		canvas.SetCell(cellX+1, cellY, leafCell(h*2654435761+1, l))
 	}
 	// Scan trunks across the viewport plus a margin (canopies reach up to
 	// treeCanopyReach rows above their trunk and two tiles to either side).

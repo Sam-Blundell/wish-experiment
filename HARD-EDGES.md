@@ -74,6 +74,53 @@ start* with no graceful error.
 generation behind a function that can return an error instead of panicking at
 init.
 
+## Rendering & lighting
+
+### One global colour formula can't light a hand-built palette · [lived]
+Every tile is a rune resolved to a `uv.Style` *procedurally* at render time
+(`grassCell`/`meadowCell` for texture, plus a big per-tile `switch`), and
+day/night is then a single global colour transform layered on top of whatever
+colour each tile happened to resolve to: `dayTint` produces `(dim, warmth)`,
+`tintNight` darkens by `dim` (lipgloss `Darken`) and warms by `warmth`
+(`warmMul`, which cuts the green and blue channels), and light spill lifts/warms
+cells near a source (`lightAt` falloff, `glowNight` for windows). One formula has
+to flatter every tile at once — and it can't. Warm enough to suit the grass turns
+the dirt path and tree trunks red (brown is mostly red+green, so cutting green
+leaves red); spill bright enough to read on the path over-lights the grass and
+washes out the cabin. Tuning the knobs (`maxNightDim`, `maxWarmth`,
+`warmGreenCut`/`warmBlueCut`, `lightRadius`, `maxLift`) turned into whack-a-mole —
+every fix for one tile broke another. This is the ceiling of *deriving* every
+tile's lit appearance from a single formula, and the spike hit it firsthand.
+
+**Rewrite — author appearance per entity instead of deriving it.** Make the world
+a data-driven **entity catalogue**: each tile/sprite (`grass`, `dirt-path`,
+`water`, `wall`, `wall-with-window`, `oak`…) is a *record*, not a rune plus a
+`switch` case plus a procedural fill. Each entity then owns its own lighting,
+which dissolves the one-formula-for-all compromise. Preferred lightweight form:
+
+- **Per-entity colour endpoints.** Each entity hand-picks an authored **night**
+  colour and **day** colour — dirt's night colour is a chosen dark brown, never a
+  reddened derivation. The renderer interpolates between them by a per-cell light
+  level `t ∈ [0,1]` (0 = full dark, 1 = full day/lit):
+  `colour = lerp(night, day, t)`. Global dusk/dawn lowers `t` everywhere; a light
+  source *raises* `t` toward 1 over its falloff. Because both ends are chosen, the
+  "dirt goes red" class of bug becomes structurally impossible — there's no
+  channel math left to fight the art.
+- **Extend only as needed.** More than two keyframes (night / dusk / day) if a
+  two-point lerp looks flat; a second endpoint set per **light kind** (cool
+  moonlight vs warm lamp, indoor vs outdoor) chosen by the dominant light at the
+  cell.
+- **Heavier alternative.** Full sprite-sheet variants — hand-painted art per
+  entity per discrete light level (0..N) — give total control at much higher
+  authoring cost, and make lighting discrete rather than continuous. Endpoints
+  first; reach for this only if hand-painted per-level art is ever wanted.
+
+This same catalogue is also a **prerequisite for the planned map-builder**: a map
+editor needs a discrete set of placeable, named entities to offer, which the
+current rune + `switch` + procedural-fill model doesn't expose. So the entity
+catalogue earns its place on rendering grounds *and* unblocks the tool — making it
+a strong candidate for what the rewrite is organised around.
+
 ## Persistence
 
 ### Notes are saved while holding the game lock · [lived]
