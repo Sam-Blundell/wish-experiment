@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/bubbles/v2/textarea"
@@ -125,10 +126,10 @@ var (
 	// Trees are drawn as multi-cell sprites: a narrow brown trunk (the only
 	// blocking tile) with a leafy canopy overlaid above it. See drawTrees.
 	colorTrunk       = lipgloss.Color("#6b4423") // trunk — bark brown
-	colorCanopy      = lipgloss.Color("#3a9d3a") // foliage — mid green stipple
-	colorCanopyLight = lipgloss.Color("#57b357") // foliage — sunlit highlight
-	colorCanopyDark  = lipgloss.Color("#226b22") // foliage — shadowed leaves
-	colorCanopyBg    = lipgloss.Color("#0e4f14") // foliage fill behind the stipple
+	colorCanopy      = lipgloss.Color("#46b03f") // foliage — mid green stipple
+	colorCanopyLight = lipgloss.Color("#6fce56") // foliage — sunlit highlight
+	colorCanopyDark  = lipgloss.Color("#2f7e2a") // foliage — shadowed leaves (kept above grass so dark cells don't vanish)
+	colorCanopyBg    = lipgloss.Color("#237025") // foliage fill behind the stipple — lifted well above colorGrassBg (#004800) so even sparse/dark cells read as tree, not grass
 
 	// The cabin: a shingled roof with a sunlit ridge, timber walls, lit
 	// windows and a wooden door. See placeHouse and the tile switch in View.
@@ -630,6 +631,8 @@ func gameHelpText() string {
 	cmds := [][2]string{
 		{"/nick", "set your nickname"},
 		{"/note", "leave a note"},
+		{"/copy", "copy the chat to your clipboard"},
+		{"/time", "day/dawn/dusk/night, bare = resume (debug)"},
 		{"/help", "show this help"},
 	}
 	var b strings.Builder
@@ -1378,8 +1381,25 @@ func (m gameScreen) colW() int {
 // day/night later, change only this body to (seconds since local midnight)/86400
 // — everything downstream is unchanged.
 func dayPhase() float64 {
+	if p := math.Float64frombits(debugPhaseBits.Load()); p >= 0 {
+		return p // pinned by the /time debug command (see debugPhaseBits)
+	}
 	return float64(time.Now().UnixNano()%int64(dayCycle)) / float64(dayCycle)
 }
+
+// debugPhaseBits optionally pins the day/night clock for testing. It holds the
+// math.Float64bits of a phase in [0,1) to force that time of day, or the bits of
+// a negative value meaning "follow the live accelerated cycle". It is read every
+// render from many session goroutines — and from the tick while it holds
+// theGame.mu, so this MUST stay lock-free or dayPhase would deadlock the tick —
+// and written by /time. The clock is global, so /time changes the time for every
+// connected player: fine for a dev tool, but it would need gating in a real build.
+var debugPhaseBits atomic.Uint64
+
+func init() { debugPhaseBits.Store(math.Float64bits(-1)) } // default: the live cycle
+
+// setDebugPhase pins the clock to phase p; a negative p resumes the live cycle.
+func setDebugPhase(p float64) { debugPhaseBits.Store(math.Float64bits(p)) }
 
 // dayDim is the night-darkness curve over the cycle: a trapezoid that sits at
 // full day or full night for most of it, with short dawn/dusk ramps between —
@@ -1678,6 +1698,10 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 				m.mode = inputModeMove
 				m.input.Reset()
 				m.input.Blur()
+				// post carries an optional command from a chat action (e.g.
+				// /copy → write the system clipboard). We stash it and batch it
+				// into the final return so re-focusing the big chat can't drop it.
+				var post tea.Cmd
 				switch mode {
 				case inputModeSpeak, inputModeBigChat:
 					// The chat bar (inline or full-screen) doubles as the command
@@ -1707,6 +1731,29 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 						return m, m.input.Focus()
 					case strings.HasPrefix(cmd, "/note "):
 						theGame.addNote(m.player, strings.TrimPrefix(cmd, "/note "))
+					case cmd == "/copy":
+						// Copy this world's chat to the player's own system
+						// clipboard over OSC52, and drop a local-only confirmation
+						// into the log — not broadcast, and replaced by the next
+						// snapshot, so it reads as a transient personal notice.
+						n := len(m.chat)
+						post = tea.SetClipboard(chatTranscript(m.chat))
+						m.chat = append(m.chat, gameChatLine{text: fmt.Sprintf("copied %d chat lines to your clipboard", n)})
+					case cmd == "/time", strings.HasPrefix(cmd, "/time "):
+						// Debug: pin the global day/night clock so we don't have to
+						// wait out the accelerated cycle when checking daytime colour.
+						switch strings.TrimSpace(strings.TrimPrefix(cmd, "/time")) {
+						case "day":
+							setDebugPhase(0.50) // full-day plateau
+						case "dawn":
+							setDebugPhase(0.25) // mid dawn ramp
+						case "dusk":
+							setDebugPhase(0.75) // mid dusk ramp
+						case "night":
+							setDebugPhase(0.00) // deepest night
+						default: // bare /time (or anything unrecognised) → live cycle
+							setDebugPhase(-1)
+						}
 					default:
 						theGame.say(m.player, text)
 					}
@@ -1719,9 +1766,9 @@ func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 					m.mode = inputModeBigChat
 					m.syncChatVP() // the chat grew with our message
 					m.chatVP.GotoBottom()
-					return m, m.input.Focus()
+					return m, tea.Batch(post, m.input.Focus())
 				}
-				return m, nil
+				return m, post
 			}
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
@@ -2455,24 +2502,38 @@ func bigChatLogHeight(height, inputH int) int {
 	return logH
 }
 
-// wrapChatLines renders every chat message wrapped to width, returning all the
-// visual lines (newest last), each carrying the panel background. It wraps long
-// messages rather than truncating like the docked renderChatLog.
-func wrapChatLines(chat []gameChatLine, width int) []string {
-	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Background(colorPanelBg)
-	textStyle := lipgloss.NewStyle().Foreground(colorCream).Background(colorPanelBg)
-	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true).Background(colorPanelBg)
-	wrap := lipgloss.NewStyle().Width(width).Background(colorPanelBg)
+// chatRows is the single chat-rendering path, shared by the big-chat viewport and
+// the docked log. It renders every message to `width`, wrapping (not truncating)
+// long lines, and returns the resulting visual rows oldest-first. `bg` is painted
+// behind each row — the grey panel for the big chat, nil (transparent) for the
+// docked log, which floats over the map.
+func chatRows(chat []gameChatLine, width int, bg color.Color) []string {
+	sender := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
+	text := lipgloss.NewStyle().Foreground(colorCream)
+	system := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true)
+	wrap := lipgloss.NewStyle().Width(width)
+	if bg != nil {
+		sender = sender.Background(bg)
+		text = text.Background(bg)
+		system = system.Background(bg)
+		wrap = wrap.Background(bg)
+	}
 
 	var rows []string
 	for _, line := range chat {
-		rendered := senderStyle.Render(line.from+": ") + textStyle.Render(line.text)
+		rendered := sender.Render(line.from+": ") + text.Render(line.text)
 		if line.from == "" {
-			rendered = systemStyle.Render("* " + line.text)
+			rendered = system.Render("* " + line.text)
 		}
 		rows = append(rows, strings.Split(wrap.Render(rendered), "\n")...)
 	}
 	return rows
+}
+
+// wrapChatLines renders the big-chat log: every message wrapped to width on the
+// panel background. A thin wrapper over the shared chatRows.
+func wrapChatLines(chat []gameChatLine, width int) []string {
+	return chatRows(chat, width, colorPanelBg)
 }
 
 // syncChatVP sizes the big-chat viewport to the current panel and loads it with
@@ -2503,57 +2564,37 @@ func (m *gameScreen) syncChatVPStick() {
 	}
 }
 
-// renderChatLog formats the last `lines` chat messages into exactly `lines`
-// rows — newest at the bottom, blank-padded at the top so the pane is a fixed
-// height — each clipped to `width` columns.
+// renderChatLog formats the docked chat pane: exactly `lines` rows, newest at the
+// bottom and blank-padded at the top so the pane is a fixed height. Long messages
+// soft-wrap (sharing chatRows with the big chat) instead of being clipped. We feed
+// it only the last `lines` messages — each is at least one visual row, so that is
+// always enough to fill the pane — which keeps this cheap on the per-frame path.
 func renderChatLog(chat []gameChatLine, width, lines int) string {
-	senderStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
-	textStyle := lipgloss.NewStyle().Foreground(colorCream)
-	systemStyle := lipgloss.NewStyle().Foreground(colorAmberDim).Italic(true)
-
-	start := len(chat) - lines
-	if start < 0 {
-		start = 0
+	if start := len(chat) - lines; start > 0 {
+		chat = chat[start:]
 	}
-	recent := chat[start:]
-
-	rows := make([]string, 0, lines)
-	for i := 0; i < lines-len(recent); i++ {
-		rows = append(rows, "") // top-pad so the log sits at the bottom of its region
+	rows := chatRows(chat, width, nil) // nil bg: the dock is transparent over the map
+	if len(rows) > lines {
+		rows = rows[len(rows)-lines:] // keep the newest visual rows, bottom-aligned
 	}
-	for _, line := range recent {
-		if line.from == "" {
-			rows = append(rows, systemStyle.Render(truncateText("* "+line.text, width)))
-			continue
-		}
-		prefix := line.from + ": "
-		budget := width - lipgloss.Width(prefix)
-		if budget < 1 {
-			budget = 1
-		}
-		rows = append(rows, senderStyle.Render(prefix)+textStyle.Render(truncateText(line.text, budget)))
+	for len(rows) < lines {
+		rows = append([]string{""}, rows...) // top-pad so the log sits at the bottom
 	}
 	return strings.Join(rows, "\n")
 }
 
-// truncateText clips s to at most `max` display columns, adding an ellipsis when
-// it overflows. Width is approximated by rune count for the cut, which is exact
-// for the latin text chat is overwhelmingly made of.
-func truncateText(s string, max int) string {
-	if max <= 0 {
-		return ""
+// chatTranscript renders the chat backlog as plain text for the clipboard: one
+// line per message, "nick: text" (or "* text" for system lines), no styling.
+func chatTranscript(chat []gameChatLine) string {
+	var b strings.Builder
+	for _, line := range chat {
+		if line.from == "" {
+			fmt.Fprintf(&b, "* %s\n", line.text)
+		} else {
+			fmt.Fprintf(&b, "%s: %s\n", line.from, line.text)
+		}
 	}
-	if lipgloss.Width(s) <= max {
-		return s
-	}
-	if max == 1 {
-		return "…"
-	}
-	r := []rune(s)
-	if len(r) > max-1 {
-		r = r[:max-1]
-	}
-	return string(r) + "…"
+	return b.String()
 }
 
 // setInputInPanel gives the compose input the panel's grey background (when it's

@@ -28,6 +28,7 @@ import (
 	"charm.land/wish/v2/bubbletea"
 	"charm.land/wish/v2/logging"
 	"charm.land/wish/v2/recover"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/ssh"
 )
 
@@ -76,9 +77,24 @@ func main() {
 					// don't care about this return value".
 					ip, _, _ := net.SplitHostPort(s.RemoteAddr().String())
 					root := newRoot(s, ip)
-					// A function in Go can return multiple values. Here we return
-					// the root model and `nil` for the program options (no extras).
-					return root, nil
+					// A function in Go can return multiple values: here the root
+					// model plus a list of Bubble Tea program options.
+					//
+					// We force a truecolor (24-bit) colour profile. Bubble Tea
+					// otherwise picks the profile at startup with
+					// colorprofile.Detect, which over SSH only sees the environment
+					// the client forwarded. OpenSSH forwards $TERM but *not*
+					// $COLORTERM by default, so a normal `xterm-256color` session
+					// detects as 256-colour — and every RGB colour we use (the whole
+					// day/night palette) would be silently quantised to the nearest
+					// of 256. Our players connect from modern truecolor terminals, so
+					// we declare it outright. (The adaptive alternative is to ask the
+					// terminal with tea.RequestCapability("RGB"/"Tc") and let it
+					// upgrade itself, but that relies on the terminal answering an
+					// XTGETTCAP query; forcing is the reliable choice for this crowd.)
+					return root, []tea.ProgramOption{
+						tea.WithColorProfile(colorprofile.TrueColor),
+					}
 				}),
 				activeterm.Middleware(),
 				logging.Middleware(),
