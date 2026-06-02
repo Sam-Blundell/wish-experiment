@@ -25,18 +25,6 @@ Each entry says what it is and what the rewrite should do about it.
 
 ---
 
-## Rendering & layout
-
-### World→screen coordinate transform is recomputed inline everywhere · [read]
-Each world tile is 2 terminal cells wide, so the world→screen mapping is
-`(wx - camX + worldOffsetTilesX) * 2`. That exact expression is hand-rolled in
-several places in `game.go`'s `View` — the tile loop, tree canopies and
-nameplates — each re-deriving the camera offset and its own
-bounds clamping. Change the camera or centring logic and every copy has to move
-in lockstep or they silently drift apart.
-**Rewrite:** a single `worldToScreen(wx, wy)` helper (and its inverse), used
-everywhere a coordinate crosses the boundary.
-
 ## Concurrency & shared state
 
 ### chat drops are lost lines; the same pattern in the game is harmless · [read]

@@ -1693,6 +1693,19 @@ func (m gameScreen) View() string {
 		worldOffsetTilesY = (viewportTilesH - curWorld.height) / 2
 	}
 
+	// worldToScreen / screenToWorld are the single source of truth for the
+	// world↔canvas transform — it used to be hand-rolled in the tile loop, the
+	// tree canopy and the nameplates, each re-deriving it. Each world tile is two
+	// cells wide; worldOffset shifts a world smaller than the viewport so it
+	// renders centred. Coordinates are canvas-relative (the base layer sits at
+	// the canvas origin).
+	worldToScreen := func(wx, wy int) (col, row int) {
+		return (wx - camX + worldOffsetTilesX) * 2, wy - camY + worldOffsetTilesY
+	}
+	screenToWorld := func(tx, ty int) (wx, wy int) {
+		return camX + tx - worldOffsetTilesX, camY + ty - worldOffsetTilesY
+	}
+
 	// Cell styles. These are ultraviolet styles (the lower-level type that
 	// Lip Gloss v2's Canvas operates on) rather than lipgloss.Style — we're
 	// going under Lip Gloss for direct cell access. `Attrs` is a bitfield
@@ -1820,11 +1833,9 @@ func (m gameScreen) View() string {
 	canvas := lipgloss.NewCanvas(m.width, viewportH)
 	for y := 0; y < viewportTilesH; y++ {
 		for tx := 0; tx < viewportTilesW; tx++ {
-			// World coord = camera position + screen offset, minus the
-			// centring shift. When the world is bigger than the viewport
-			// the offset is zero and this reduces to the original calc.
-			wx := camX + tx - worldOffsetTilesX
-			wy := camY + y - worldOffsetTilesY
+			// Screen tile → world tile. When the world is bigger than the
+			// viewport the centring offset is zero (see screenToWorld).
+			wx, wy := screenToWorld(tx, y)
 			cx := tx * 2 // left cell of this 2-wide tile
 
 			// Out-of-world (or in the blank "margin" around a small world):
@@ -1971,8 +1982,7 @@ func (m gameScreen) View() string {
 		if wx == me.x && wy == me.y {
 			return // keep our own avatar visible through the leaves
 		}
-		cellX := (wx - camX + worldOffsetTilesX) * 2
-		cellY := wy - camY + worldOffsetTilesY
+		cellX, cellY := worldToScreen(wx, wy)
 		if cellX < 0 || cellX+1 >= m.width || cellY < 0 || cellY >= viewportTilesH {
 			return
 		}
@@ -2048,7 +2058,6 @@ func (m gameScreen) View() string {
 	// it. Speech is in the chat pane now (no floating bubbles), so nameplates
 	// and the read modal are the only overlays left.
 	layers := []*lipgloss.Layer{lipgloss.NewLayer(base)}
-	const canvasOffsetY = 0 // base rows: [0..] canvas (the map is the top of the frame now)
 
 	// onScreen reports whether a world tile is inside the current viewport.
 	onScreen := func(x, y int) bool {
@@ -2071,11 +2080,10 @@ func (m gameScreen) View() string {
 		if info.messageExpires.After(now) {
 			plateText, style = "! "+info.name, cueStyle
 		}
-		playerCol := (info.x - camX + worldOffsetTilesX) * 2
-		playerRow := canvasOffsetY + (info.y - camY + worldOffsetTilesY)
+		playerCol, playerRow := worldToScreen(info.x, info.y)
 		// Prefer above the player, flip below if at the top of the canvas.
 		nameRow := playerRow - 1
-		if nameRow < canvasOffsetY {
+		if nameRow < 0 {
 			nameRow = playerRow + 1
 		}
 		plate := style.Render(plateText)
