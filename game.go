@@ -49,6 +49,8 @@ const (
 	harvestGrace     = 1000 * time.Millisecond // how long a space press keeps a harvest "held"; > one harvest, so a tap yields one unit and holding streams
 	handaxeUses      = 6                       // harvests a handaxe lasts before it breaks (≈ one stone tool's worth)
 	toastDuration    = 3 * time.Second         // how long a /craft or break notice stays on screen
+	treePool         = 5                       // wood a tree yields to tools before it's a stump
+	rockPool         = 5                       // stone a boulder yields before it's rubble
 	cueDuration      = 4 * time.Second         // how long a speaker's nameplate blinks after they talk
 	cueBlinkInterval = 500 * time.Millisecond  // the !↔name toggle period during that blink
 	tickInterval     = 100 * time.Millisecond  // world heartbeat: rate the hub coalesces state changes into one broadcast
@@ -935,6 +937,7 @@ type game struct {
 	dirty         bool                   // state changed since the last tick; the tick loop broadcasts and clears it
 	lastDayStage  int                    // last day/night stage broadcast; a change re-tints the world (see tickOnce)
 	lastWaterStep int                    // last pond-ripple step broadcast; a change animates the water surface (see tickOnce)
+	nodePool      map[[3]int]int         // tool-harvest depletion: {worldID,x,y} → material left; absent = intact, <=0 = spent (stump/rubble)
 }
 
 var theGame = &game{
@@ -1199,6 +1202,14 @@ func (in inventory) short() string {
 // isHarvestable reports whether a tile is a gatherable node.
 func isHarvestable(t tile) bool { return t == tileTree || t == tileRock }
 
+// poolFor is the material a fresh node holds before tools exhaust it to a stump.
+func poolFor(t tile) int {
+	if t == tileTree {
+		return treePool
+	}
+	return rockPool
+}
+
 // startHarvest aims the player at an adjacent node and (re)arms the hold. Each
 // space press calls this; the tick (advanceHarvest) does the work while the hold
 // stays live. Switching to a new node resets progress.
@@ -1241,22 +1252,33 @@ func (g *game) advanceHarvest(p *gamePlayer, now time.Time) {
 	if p.harvestProgress >= harvestTicks {
 		p.harvestProgress = 0
 		tool := p.handaxe > 0 // with a handaxe you get usable wood/stone, not scrap
-		switch w.tiles[hy][hx] {
-		case tileTree:
-			if tool {
+		key := [3]int{p.worldID, hx, hy}
+		rem, drawn := g.nodePool[key]
+		switch {
+		case drawn && rem <= 0:
+			// spent: a stump/rubble gives nothing more, even bare-handed
+		case tool:
+			// usable material, drawing the node's finite pool toward spent
+			if !drawn {
+				rem = poolFor(w.tiles[hy][hx])
+			}
+			if g.nodePool == nil {
+				g.nodePool = map[[3]int]int{}
+			}
+			g.nodePool[key] = rem - 1
+			if w.tiles[hy][hx] == tileTree {
 				p.inv.wood++
 			} else {
-				p.inv.sticks++
-			}
-		case tileRock:
-			if tool {
 				p.inv.stone++
+			}
+			p.handaxe-- // a handaxe wears out fast; bare-hand scrap doesn't
+		default:
+			// bare hands: scrap only, and the node is never depleted
+			if w.tiles[hy][hx] == tileTree {
+				p.inv.sticks++
 			} else {
 				p.inv.looseStones++
 			}
-		}
-		if tool {
-			p.handaxe-- // a handaxe wears out fast; bare-hand scrap doesn't
 		}
 	}
 }
@@ -1426,6 +1448,20 @@ func (g *game) allNotes() []note {
 	return out
 }
 
+// depletedFor returns the spent node coords (stumps/rubble) in a world, copied so
+// the renderer can read them without the lock — pulled per snapshot, like notes.
+func (g *game) depletedFor(worldID int) map[[2]int]bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[[2]int]bool{}
+	for key, rem := range g.nodePool {
+		if key[0] == worldID && rem <= 0 {
+			out[[2]int{key[1], key[2]}] = true
+		}
+	}
+	return out
+}
+
 // markDirty records that shared state changed. Rather than broadcasting a fresh
 // snapshot on every single change (a move, a chat line, a note), callers just
 // flag the world dirty and the tick loop coalesces a burst of changes into one
@@ -1519,20 +1555,21 @@ type gameScreen struct {
 	height       int
 	player       *gamePlayer
 	snapshot     gameSnapshot
-	notes        []note         // this world's notes, refreshed when a snapshot arrives
-	chat         []gameChatLine // this world's chat backlog, refreshed when a snapshot arrives
-	chatVP       viewport.Model // big-chat scroll view; size/content synced in syncChatVP, scroll persists here
-	mode         inputMode      // current keyboard mode (move / speak / rename / read / note)
-	input        textarea.Model // wrapping compose input for speak, rename and note modes
-	readingText  string         // text shown in the modal (sign or note)
-	enhanced     bool           // terminal reports key release/repeat → smooth held-movement (else per-press)
-	lastMove     time.Time      // fallback path only: time of the last per-press move, to rate-cap movement
-	camX, camY   int            // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
-	sentTyping   bool           // last typing state reported to the hub (so we only re-lock on change)
-	toast        string         // transient on-screen notice (toast)
-	toastExpires time.Time      // when the toast clears
-	toastTickFor time.Time      // the toastExpires we've already armed a clear-tick for
-	lastHandaxe  int            // last-seen handaxe count, to detect a break
+	notes        []note          // this world's notes, refreshed when a snapshot arrives
+	chat         []gameChatLine  // this world's chat backlog, refreshed when a snapshot arrives
+	chatVP       viewport.Model  // big-chat scroll view; size/content synced in syncChatVP, scroll persists here
+	mode         inputMode       // current keyboard mode (move / speak / rename / read / note)
+	input        textarea.Model  // wrapping compose input for speak, rename and note modes
+	readingText  string          // text shown in the modal (sign or note)
+	enhanced     bool            // terminal reports key release/repeat → smooth held-movement (else per-press)
+	lastMove     time.Time       // fallback path only: time of the last per-press move, to rate-cap movement
+	camX, camY   int             // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
+	sentTyping   bool            // last typing state reported to the hub (so we only re-lock on change)
+	toast        string          // transient on-screen notice (toast)
+	toastExpires time.Time       // when the toast clears
+	toastTickFor time.Time       // the toastExpires we've already armed a clear-tick for
+	lastHandaxe  int             // last-seen handaxe count, to detect a break
+	depleted     map[[2]int]bool // spent nodes in our world (stumps/rubble), pulled per snapshot
 }
 
 func newGameScreen(s ssh.Session, ip string, width, height int, enhanced bool) Screen {
@@ -1933,6 +1970,7 @@ func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 		m.snapshot = gameSnapshot(msg)
 		m.notes = theGame.allNotes()
 		me := msg[m.player]
+		m.depleted = theGame.depletedFor(me.worldID)
 		if m.lastHandaxe > 0 && me.handaxe == 0 {
 			m.toast = "your handaxe broke"
 			m.toastExpires = time.Now().Add(toastDuration)
@@ -2472,7 +2510,9 @@ func (m gameScreen) View() string {
 				// of the tile) so grass shows at the sides. Large trees get a
 				// chunkier full-width trunk. The leafy canopy above it is drawn
 				// later by drawTrees.
-				if treeVariant(wx, wy) == 2 {
+				if m.depleted[[2]int{wx, wy}] {
+					fill, leftRune = stumpFill, "○" // cut to a stump — nothing left
+				} else if treeVariant(wx, wy) == 2 {
 					fill, leftRune, rightRune = trunkFill, "█", "█"
 				} else {
 					fill, leftRune, rightRune = trunkFill, "▐", "▌"
@@ -2519,7 +2559,11 @@ func (m gameScreen) View() string {
 				// plank seam. Walking into it triggers the teleport.
 				fill, leftRune, rightRune = doorFill, "▐", "▌"
 			case tileRock:
-				fill, leftRune, rightRune = rockFill, "▒", "▒"
+				if m.depleted[[2]int{wx, wy}] {
+					fill, leftRune, rightRune = rockFill, "▖", "▗" // mined down to rubble
+				} else {
+					fill, leftRune, rightRune = rockFill, "▒", "▒"
+				}
 			case tileBush:
 				fill, leftRune, rightRune = bushFill, "♣", "♣"
 			case tileStump:
@@ -2636,7 +2680,7 @@ func (m gameScreen) View() string {
 			continue
 		}
 		for wx := camX - 2; wx < camX+viewportTilesW+2 && wx < curWorld.width; wx++ {
-			if wx < 0 || curWorld.tiles[wy][wx] != tileTree {
+			if wx < 0 || curWorld.tiles[wy][wx] != tileTree || m.depleted[[2]int{wx, wy}] {
 				continue
 			}
 			for _, off := range treeCanopies[treeVariant(wx, wy)] {
