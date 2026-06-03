@@ -47,6 +47,8 @@ const (
 	gameMaxPlayers   = 20
 	harvestTicks     = 8                       // tick beats to harvest one unit (~0.8s at tickInterval)
 	harvestGrace     = 1000 * time.Millisecond // how long a space press keeps a harvest "held"; > one harvest, so a tap yields one unit and holding streams
+	handaxeUses      = 6                       // harvests a handaxe lasts before it breaks (≈ one stone tool's worth)
+	toastDuration    = 3 * time.Second         // how long a /craft or break notice stays on screen
 	cueDuration      = 4 * time.Second         // how long a speaker's nameplate blinks after they talk
 	cueBlinkInterval = 500 * time.Millisecond  // the !↔name toggle period during that blink
 	tickInterval     = 100 * time.Millisecond  // world heartbeat: rate the hub coalesces state changes into one broadcast
@@ -291,6 +293,7 @@ const (
 	worldOutdoor = 0
 	worldHouse   = 1
 	worldMeadow  = 2
+	worldNorth   = 3
 )
 
 // worlds is the slice of all game cells. Generated once at startup —
@@ -301,6 +304,7 @@ var worlds = func() []*worldGrid {
 	outdoor := generateOutdoor()
 	house := generateHouse()
 	meadow := generateMeadow()
+	north := generateNorth()
 
 	// Outdoor cabin at (80, 18): top-left of its 7×4 footprint. The door
 	// is at the south face. Stepping into that door drops the player one
@@ -365,7 +369,7 @@ var worlds = func() []*worldGrid {
 
 	// A signpost at the forest junction, just east of where the paths meet.
 	placeSign(outdoor, linkX+4, worldHeight/2+2,
-		"— FOREST CROSSING —\n\nNorth: the cabin\nSouth: the meadow\n\nMind the boggy ponds.")
+		"— FOREST CROSSING —\n\nNE: the cabin\nN: the wild woods\nS: the meadow\n\nMind the boggy ponds.")
 	// A jetty out over the north-west pond.
 	placeJetty(outdoor, worldWidth/3, worldHeight/3+1, worldHeight/3+5)
 
@@ -373,7 +377,27 @@ var worlds = func() []*worldGrid {
 	placeWell(meadow, 50, worldHeight/2+2)
 	placeStones(meadow, 76, worldHeight/2+4)
 
-	return []*worldGrid{outdoor, house, meadow}
+	// North link: walk off the forest's north edge into the wilderness — denser
+	// woods + boulders, where harvesting and depletion live (so the spawn world
+	// stays unscarred). Mirrors the meadow link, flipped north.
+	scatterClutter(north, rand.New(rand.NewSource(67)))
+	carvePath(outdoor, worldWidth/2, worldHeight/2, linkX, 1, rand.New(rand.NewSource(71)))
+	carvePath(north, linkX, worldHeight-2, linkX, worldHeight/2, rand.New(rand.NewSource(73)))
+	for dx := -1; dx <= 1; dx++ {
+		fx := linkX + dx
+		outdoor.tiles[0][fx] = tileDirt
+		north.tiles[worldHeight-1][fx] = tileDirt
+		outdoor.doors = append(outdoor.doors, door{
+			x: fx, y: 0,
+			target: doorTarget{worldID: worldNorth, x: linkX, y: worldHeight - 3},
+		})
+		north.doors = append(north.doors, door{
+			x: fx, y: worldHeight - 1,
+			target: doorTarget{worldID: worldOutdoor, x: linkX, y: 2},
+		})
+	}
+
+	return []*worldGrid{outdoor, house, meadow, north}
 }()
 
 // generateOutdoor builds the open-air cell: grass with a tree border,
@@ -481,6 +505,63 @@ func generateMeadow() *worldGrid {
 		}
 	}
 	return &worldGrid{tiles: tiles, width: worldWidth, height: worldHeight, floor: tileMeadow}
+}
+
+// generateNorth builds the wilderness cell reached by walking off the forest's
+// north edge: grass with a tree border (opened at the south where the path
+// enters), thick groves, and — via scatterClutter in the initialiser — plenty of
+// boulders. This is the gathering ground, so harvesting and depletion happen here
+// rather than scarring the spawn world. (The grove loop mirrors generateOutdoor's;
+// a rewrite would factor it into a shared helper.)
+func generateNorth() *worldGrid {
+	r := rand.New(rand.NewSource(53))
+	tiles := make([][]tile, worldHeight)
+	for y := range tiles {
+		tiles[y] = make([]tile, worldWidth)
+		for x := range tiles[y] {
+			tiles[y][x] = tileGrass
+		}
+	}
+	for x := 0; x < worldWidth; x++ {
+		tiles[0][x] = tileTree
+		tiles[worldHeight-1][x] = tileTree
+	}
+	for y := 0; y < worldHeight; y++ {
+		tiles[y][0] = tileTree
+		tiles[y][worldWidth-1] = tileTree
+	}
+	// Thicker than the spawn forest (12 groves vs 8) — it's deep wood, with lots
+	// to harvest. Trunks stay spaced so canopies read as separate trees.
+	const (
+		groveCount = 12
+		trunkSpace = 2
+	)
+	for g := 0; g < groveCount; g++ {
+		cx := r.Intn(worldWidth-2) + 1
+		cy := r.Intn(worldHeight-2) + 1
+		radius := 6 + r.Intn(7)
+		r2 := radius * radius
+		for a := 0; a < 4*r2; a++ {
+			dx := r.Intn(2*radius+1) - radius
+			dy := r.Intn(2*radius+1) - radius
+			d2 := dx*dx + dy*dy
+			if d2 > r2 {
+				continue
+			}
+			if frac := float64(d2) / float64(r2); frac > 0.7 && r.Float64() < (frac-0.7)/0.3 {
+				continue
+			}
+			x, y := cx+dx, cy+dy
+			if x < 1 || x >= worldWidth-1 || y < 1 || y >= worldHeight-1 {
+				continue
+			}
+			if hasTreeNear(tiles, x, y, trunkSpace) {
+				continue
+			}
+			tiles[y][x] = tileTree
+		}
+	}
+	return &worldGrid{tiles: tiles, width: worldWidth, height: worldHeight, floor: tileGrass}
 }
 
 // generateHouse builds the interior cell: an 18×12 stone-walled room with
@@ -638,6 +719,7 @@ func gameHelpText() string {
 		{"/note", "leave a note"},
 		{"/copy", "copy the chat to your clipboard"},
 		{"/time", "day/dawn/dusk/night, bare = resume (debug)"},
+		{"/craft", "knap a handaxe from a loose stone"},
 		{"/help", "show this help"},
 	}
 	var b strings.Builder
@@ -810,6 +892,7 @@ type gamePlayer struct {
 	harvestProgress    int
 	harvesting         bool
 	typing             bool
+	handaxe            int // crude tool: uses left before it breaks (0 = none)
 }
 
 func (p *gamePlayer) displayName() string {
@@ -831,6 +914,7 @@ type gamePlayerInfo struct {
 	harvesting         bool // currently harvesting → flash a # on the target node
 	harvestX, harvestY int
 	typing             bool // composing a message → flash a grey … on the nameplate
+	handaxe            int  // handaxe uses left (0 = none) — shown in the status line
 }
 
 // gameSnapshot is the message broadcast to every player after each state
@@ -1053,6 +1137,28 @@ func (g *game) setTyping(p *gamePlayer, typing bool) {
 	g.dirty = true
 }
 
+// knapHandaxe turns a loose stone into a handaxe (with handaxeUses uses) and
+// returns a short notice for the player. Bare-handed gathering always refills
+// loose stones, so you can knap another once one breaks.
+func (g *game) knapHandaxe(p *gamePlayer) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.players[p]; !ok {
+		return ""
+	}
+	switch {
+	case p.handaxe > 0:
+		return "you already have a handaxe"
+	case p.inv.looseStones < 1:
+		return "need a loose stone — gather one bare-handed from a rock first"
+	default:
+		p.inv.looseStones--
+		p.handaxe = handaxeUses
+		g.dirty = true
+		return fmt.Sprintf("knapped a handaxe (%d uses)", handaxeUses)
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Gathering (Phase 1: bare-hand harvest)
 //
@@ -1134,11 +1240,23 @@ func (g *game) advanceHarvest(p *gamePlayer, now time.Time) {
 	p.harvestProgress++
 	if p.harvestProgress >= harvestTicks {
 		p.harvestProgress = 0
+		tool := p.handaxe > 0 // with a handaxe you get usable wood/stone, not scrap
 		switch w.tiles[hy][hx] {
 		case tileTree:
-			p.inv.sticks++
+			if tool {
+				p.inv.wood++
+			} else {
+				p.inv.sticks++
+			}
 		case tileRock:
-			p.inv.looseStones++
+			if tool {
+				p.inv.stone++
+			} else {
+				p.inv.looseStones++
+			}
+		}
+		if tool {
+			p.handaxe-- // a handaxe wears out fast; bare-hand scrap doesn't
 		}
 	}
 }
@@ -1164,6 +1282,7 @@ func (g *game) buildSnapshot() gameSnapshot {
 			harvestX:       p.harvestX,
 			harvestY:       p.harvestY,
 			typing:         p.typing,
+			handaxe:        p.handaxe,
 		}
 	}
 	return snap
@@ -1396,20 +1515,24 @@ func gameWaitForSnap(sub chan gameSnapshot) tea.Cmd {
 }
 
 type gameScreen struct {
-	width       int
-	height      int
-	player      *gamePlayer
-	snapshot    gameSnapshot
-	notes       []note         // this world's notes, refreshed when a snapshot arrives
-	chat        []gameChatLine // this world's chat backlog, refreshed when a snapshot arrives
-	chatVP      viewport.Model // big-chat scroll view; size/content synced in syncChatVP, scroll persists here
-	mode        inputMode      // current keyboard mode (move / speak / rename / read / note)
-	input       textarea.Model // wrapping compose input for speak, rename and note modes
-	readingText string         // text shown in the modal (sign or note)
-	enhanced    bool           // terminal reports key release/repeat → smooth held-movement (else per-press)
-	lastMove    time.Time      // fallback path only: time of the last per-press move, to rate-cap movement
-	camX, camY  int            // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
-	sentTyping  bool           // last typing state reported to the hub (so we only re-lock on change)
+	width        int
+	height       int
+	player       *gamePlayer
+	snapshot     gameSnapshot
+	notes        []note         // this world's notes, refreshed when a snapshot arrives
+	chat         []gameChatLine // this world's chat backlog, refreshed when a snapshot arrives
+	chatVP       viewport.Model // big-chat scroll view; size/content synced in syncChatVP, scroll persists here
+	mode         inputMode      // current keyboard mode (move / speak / rename / read / note)
+	input        textarea.Model // wrapping compose input for speak, rename and note modes
+	readingText  string         // text shown in the modal (sign or note)
+	enhanced     bool           // terminal reports key release/repeat → smooth held-movement (else per-press)
+	lastMove     time.Time      // fallback path only: time of the last per-press move, to rate-cap movement
+	camX, camY   int            // dead-zone camera: world coord of the viewport's top-left, eased as the player moves
+	sentTyping   bool           // last typing state reported to the hub (so we only re-lock on change)
+	toast        string         // transient on-screen notice (toast)
+	toastExpires time.Time      // when the toast clears
+	toastTickFor time.Time      // the toastExpires we've already armed a clear-tick for
+	lastHandaxe  int            // last-seen handaxe count, to detect a break
 }
 
 func newGameScreen(s ssh.Session, ip string, width, height int, enhanced bool) Screen {
@@ -1757,12 +1880,23 @@ func (m *gameScreen) centerCamera() {
 // "typing" state to the hub, so entering or leaving any compose mode flips the
 // grey "…" nameplate cue for everyone — without scattering setTyping calls
 // across every input branch.
+// clearToastMsg fires after a toast's lifetime to clear it, unless a newer toast
+// has superseded it. Scheduled by the Update wrapper via tea.Tick.
+type clearToastMsg struct{}
+
 func (m gameScreen) Update(msg tea.Msg) (Screen, tea.Cmd) {
 	next, cmd := m.update(msg)
 	if gs, ok := next.(gameScreen); ok {
 		if t := composingMode(gs.mode); t != gs.sentTyping {
 			theGame.setTyping(gs.player, t)
 			gs.sentTyping = t
+			next = gs
+		}
+		// Arm a one-shot clear for a freshly-set toast, so it disappears on its
+		// own timer rather than depending on some other render to notice expiry.
+		if gs.toastExpires.After(time.Now()) && gs.toastExpires != gs.toastTickFor {
+			gs.toastTickFor = gs.toastExpires
+			cmd = tea.Batch(cmd, tea.Tick(time.Until(gs.toastExpires), func(time.Time) tea.Msg { return clearToastMsg{} }))
 			next = gs
 		}
 	}
@@ -1782,6 +1916,10 @@ func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 			m.syncChatVPStick()
 		}
 		m.updateCamera() // re-clamp to the new viewport (a now-smaller world re-centres)
+	case clearToastMsg:
+		if !time.Now().Before(m.toastExpires) {
+			m.toast = "" // expired and not superseded → clear
+		}
 	case gameSnapshotMsg:
 		// Adopt the new state and re-arm the receiver so the *next* snapshot
 		// also reaches us. Notes aren't in the snapshot (they change rarely and
@@ -1795,6 +1933,11 @@ func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 		m.snapshot = gameSnapshot(msg)
 		m.notes = theGame.allNotes()
 		me := msg[m.player]
+		if m.lastHandaxe > 0 && me.handaxe == 0 {
+			m.toast = "your handaxe broke"
+			m.toastExpires = time.Now().Add(toastDuration)
+		}
+		m.lastHandaxe = me.handaxe
 		m.chat = theGame.chatFor(me.worldID)
 		// Ease the camera toward us, but snap-centre on a world change (a door) —
 		// easing from the old world's camera would be meaningless.
@@ -1916,7 +2059,8 @@ func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 						// snapshot, so it reads as a transient personal notice.
 						n := len(m.chat)
 						post = tea.SetClipboard(chatTranscript(m.chat))
-						m.chat = append(m.chat, gameChatLine{text: fmt.Sprintf("copied %d chat lines to your clipboard", n)})
+						m.toast = fmt.Sprintf("copied %d chat lines to your clipboard", n)
+						m.toastExpires = time.Now().Add(toastDuration)
 					case cmd == "/time", strings.HasPrefix(cmd, "/time "):
 						// Debug: pin the global day/night clock so we don't have to
 						// wait out the accelerated cycle when checking daytime colour.
@@ -1931,6 +2075,11 @@ func (m gameScreen) update(msg tea.Msg) (Screen, tea.Cmd) {
 							setDebugPhase(0.00) // deepest night
 						default: // bare /time (or anything unrecognised) → live cycle
 							setDebugPhase(-1)
+						}
+					case cmd == "/craft handaxe", cmd == "/craft":
+						if msg := theGame.knapHandaxe(m.player); msg != "" {
+							m.toast = msg
+							m.toastExpires = time.Now().Add(toastDuration)
 						}
 					default:
 						theGame.say(m.player, text)
@@ -2502,6 +2651,8 @@ func (m gameScreen) View() string {
 		cellName = "house"
 	case worldMeadow:
 		cellName = "meadow"
+	case worldNorth:
+		cellName = "wild woods"
 	}
 	// Count only players in our cell — the snapshot includes everyone.
 	visibleCount := 0
@@ -2524,8 +2675,15 @@ func (m gameScreen) View() string {
 		} else if _, ok := nearbySign(me); ok {
 			label += "· i read sign "
 		}
-		if inv := me.inv; !inv.empty() {
-			label += "· " + inv.short() + " "
+		status := me.inv.short()
+		if me.handaxe > 0 {
+			if status != "" {
+				status += " · "
+			}
+			status += fmt.Sprintf("handaxe ×%d", me.handaxe)
+		}
+		if status != "" {
+			label += "· " + status + " "
 		}
 		fill := colW - lipgloss.Width(label)
 		if fill < 0 {
@@ -2655,6 +2813,14 @@ func (m gameScreen) View() string {
 	if bigChat {
 		m.syncChatVP() // size the viewport to the current panel and load the log
 		layers = append(layers, bigChatModalLayer(m.chatVP.View(), cellName, m.input.View(), m.width, m.height))
+	}
+	if m.toast != "" && time.Now().Before(m.toastExpires) {
+		box := lipgloss.NewStyle().Foreground(colorAmber).Background(colorPanelBg).Padding(0, 1).Render(m.toast)
+		tx := (m.width - lipgloss.Width(box)) / 2
+		if tx < 0 {
+			tx = 0
+		}
+		layers = append(layers, lipgloss.NewLayer(box).X(tx).Y(1))
 	}
 	return lipgloss.NewCompositor(layers...).Render()
 }

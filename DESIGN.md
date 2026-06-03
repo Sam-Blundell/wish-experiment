@@ -190,6 +190,12 @@ resources — leans into the BBS/MUD heritage and is a real differentiator.
 Raw nodes already exist as tiles **[built]**: trees, rocks / standing stones, reeds,
 mushrooms, water.
 
+**Spiked — Phase 1 [built] (2026-06-03):** bare-hand harvest — hold `space` beside a
+tree or boulder and a `#` flashes while sticks / loose stones flow into a per-player
+inventory (shown in the divider). Bare hands don't deplete the node; no tools yet,
+done in the existing outdoor world (the north cell comes later). Next: knap a handaxe
+→ wood/stone → tool durability (Phase 2), then depletion → stumps (Phase 3).
+
 ## Liveness & stickiness
 
 Low simultaneous population → two disproportionately valuable levers:
